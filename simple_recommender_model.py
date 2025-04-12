@@ -9,37 +9,50 @@ import torch.nn.functional as F
 import random
 from collections import defaultdict
 import bisect
+pd.set_option('future.no_silent_downcasting', True)
+
 class SequenceDataset(Dataset):
-    def __init__(self, item_sequences, category_sequences, item_weights=None, item_event_types=None, seq_length=5):
+    def __init__(self, item_sequences,
+                 category_sequences,
+                 property_type_sequences,
+                 property_value_sequences,
+                 item_weights=None,
+                 item_event_types=None,
+                 seq_length=5):
         self.samples = []
         
         for idx in range(len(item_sequences)):
             seq_items = item_sequences[idx]
             seq_cats = category_sequences[idx]
+            seq_prop_types = property_type_sequences[idx]
+            seq_prop_values = property_value_sequences[idx]
             seq_weights = item_weights[idx] if item_weights else [1.0] * len(seq_items)
             seq_event_types = item_event_types[idx] if item_event_types else ["view"] * len(seq_items)
             
             for j in range(len(seq_items) - 1):
                 item_input = seq_items[:j+1][-seq_length:]
                 category_input = seq_cats[:j+1][-seq_length:]
-                
+                prop_type_input = seq_prop_types[:j+1][-seq_length:]
+                prop_value_input = seq_prop_values[:j+1][-seq_length:]
                 padding_size = seq_length - len(item_input)
                 if padding_size > 0:
                     item_input = [0] * padding_size + item_input
                     category_input = [0] * padding_size + category_input
-                
+                    prop_type_input = [0] * padding_size + prop_type_input
+                    prop_value_input = [0] * padding_size + prop_value_input
                 item_target = seq_items[j+1]
                 category_target = seq_cats[j+1]
-                target_weight = seq_weights[j+1]
                 target_event_type = seq_event_types[j+1]
                 
                 sample = {
                     'item_seq': item_input,
                     'category_seq': category_input,
+                    'prop_type_seq': prop_type_input,
+                    'prop_value_seq': prop_value_input, 
                     'item_target': item_target,
                     'category_target': category_target,
-                    'target_weight': target_weight,
                     'target_event_type': target_event_type,
+                    'target_weight': seq_weights[j+1]
                 }
                 
                 self.samples.append(sample)
@@ -54,139 +67,261 @@ class SequenceDataset(Dataset):
             'category_seq': torch.tensor(sample['category_seq'], dtype=torch.long),
             'item_target': torch.tensor(sample['item_target'], dtype=torch.long),
             'category_target': torch.tensor(sample['category_target'], dtype=torch.long),
+            'prop_type_seq': torch.tensor(sample['prop_type_seq'], dtype=torch.long),
+            'prop_value_seq': torch.tensor(sample['prop_value_seq'], dtype=torch.long),
             'target_weight': torch.tensor(sample['target_weight'], dtype=torch.float),
             'target_event_type': sample['target_event_type']
         }
 
 class SequenceModel(nn.Module):
-    def __init__(self, num_items, num_categories,  embedding_dim=64):
+    def __init__(self,
+                 num_items,
+                 num_categories,
+                 num_prop_types,
+                 num_prop_values,
+                 embedding_dim=64, # Single dimension for all embeddings for simplicity
+                 hidden_dim=128): # Hidden dimension for the GRU
         super(SequenceModel, self).__init__()
 
-
-        
         self.item_embeddings = nn.Embedding(num_items, embedding_dim, padding_idx=0)
         self.category_embeddings = nn.Embedding(num_categories, embedding_dim, padding_idx=0)
-        
-        self.item_gru = nn.GRU(embedding_dim, embedding_dim, batch_first=True)
-        self.category_gru = nn.GRU(embedding_dim, embedding_dim, batch_first=True)
-        
-        self.category_predictor = nn.Linear(embedding_dim, num_categories)
-        self.item_predictor = nn.Linear(embedding_dim * 2, num_items)
-        
-    def forward(self, item_sequences, category_sequences):
+        self.prop_type_embeddings = nn.Embedding(num_prop_types, embedding_dim, padding_idx=0)
+        self.prop_value_embeddings = nn.Embedding(num_prop_values, embedding_dim, padding_idx=0)
+
+        # Calculate combined embedding size
+        combined_embedding_dim = embedding_dim * 4
+
+        # Single GRU to process the combined sequence
+        self.gru = nn.GRU(combined_embedding_dim, hidden_dim, batch_first=True)
+
+        # Predictors using the final GRU hidden state
+        self.category_predictor = nn.Linear(hidden_dim, num_categories)
+        # The item predictor uses the GRU hidden state. You could potentially
+        # concatenate the target category embedding if needed, but let's start simple.
+        self.item_predictor = nn.Linear(hidden_dim, num_items) # Predict based on sequence summary
+
+    def forward(self, item_sequences, category_sequences, prop_type_sequences, prop_value_sequences):
         batch_size = item_sequences.size(0)
-        
-        item_emb = self.item_embeddings(item_sequences)
-        category_emb = self.category_embeddings(category_sequences)
-        
-        _, item_hidden = self.item_gru(item_emb)
-        item_hidden = item_hidden.view(batch_size, -1)
-        
-        _, category_hidden = self.category_gru(category_emb)
-        category_hidden = category_hidden.view(batch_size, -1)
-        
-        category_logits = self.category_predictor(category_hidden)
-        combined_hidden = torch.cat([item_hidden, category_hidden], dim=1)
-        item_logits = self.item_predictor(combined_hidden)
-        
+        seq_length = item_sequences.size(1) # Get sequence length
+
+        # Get embeddings for all features
+        item_emb = self.item_embeddings(item_sequences)          # Shape: [batch_size, seq_length, embedding_dim]
+        category_emb = self.category_embeddings(category_sequences)  # Shape: [batch_size, seq_length, embedding_dim]
+        prop_type_emb = self.prop_type_embeddings(prop_type_sequences) # Shape: [batch_size, seq_length, embedding_dim]
+        prop_value_emb = self.prop_value_embeddings(prop_value_sequences) # Shape: [batch_size, seq_length, embedding_dim]
+
+        # Concatenate embeddings along the feature dimension
+        combined_emb = torch.cat([item_emb, category_emb, prop_type_emb, prop_value_emb], dim=2)
+        # Shape: [batch_size, seq_length, embedding_dim * 4]
+
+        # Pass the combined sequence through the GRU
+        # Output shape: [batch_size, seq_length, hidden_dim]
+        # Final hidden state shape: [1, batch_size, hidden_dim]
+        gru_output, final_hidden_state = self.gru(combined_emb)
+
+        # Use the final hidden state (from the last sequence step) for prediction
+        # Squeeze the first dimension (layer dim) -> [batch_size, hidden_dim]
+        final_hidden_state = final_hidden_state.squeeze(0)
+
+        # Predict categories and items based on the final hidden state
+        category_logits = self.category_predictor(final_hidden_state)
+        item_logits = self.item_predictor(final_hidden_state)
+
         return category_logits, item_logits
-    
+
     def calculate_loss(self, category_logits, item_logits, target_category, target_item, weights=None):
         category_loss = F.cross_entropy(category_logits, target_category, reduction='none')
         item_loss = F.cross_entropy(item_logits, target_item, reduction='none')
-        
+
         if weights is not None:
-            category_loss = category_loss * weights
-            item_loss = item_loss * weights
-            
+            # Ensure weights have the correct shape if they are per-sample
+             # If weights tensor is 1D [batch_size], expand it for broadcasting
+            if weights.dim() == 1:
+                 weights = weights.unsqueeze(1) # Shape becomes [batch_size, 1]
+
+            # Apply weights element-wise
+            # Ensure losses are correctly shaped before multiplication if needed
+            # F.cross_entropy with reduction='none' returns loss per element [batch_size]
+            category_loss = category_loss * weights.squeeze() # Squeeze back if necessary
+            item_loss = item_loss * weights.squeeze()
+
         category_loss = category_loss.mean()
         item_loss = item_loss.mean()
-        
+
+        # Adjust weighting between item and category loss if desired
         return item_loss * 0.8 + category_loss * 0.2
 
 def data_processing(data_path, session_length=30):
+    print("Loading data...")
     events = pd.read_csv(os.path.join(data_path, 'events.csv'))
     categories = pd.read_csv(os.path.join(data_path, 'category_tree.csv'))
-    items = pd.concat([pd.read_csv(os.path.join(data_path, 'item_properties_part1.csv')),
-                       pd.read_csv(os.path.join(data_path, 'item_properties_part2.csv'))])
-    
-    item2category = categories.groupby('categoryid')['parentid'].apply(list).to_dict()
-    category2items = categories.groupby('parentid')['categoryid'].apply(list).to_dict()
+    items_part1 = pd.read_csv(os.path.join(data_path, 'item_properties_part1.csv'))
+    items_part2 = pd.read_csv(os.path.join(data_path, 'item_properties_part2.csv'))
+    items = pd.concat([items_part1, items_part2], ignore_index=True)
+    del items_part1, items_part2
 
+    # --- Prepare Categories ---
+    print("Preparing categories...")
+    categories = categories.rename(columns={'categoryid': 'category_id', 'parentid': 'parent_id'})
+    items.loc[items['property'] == 'available', 'property'] = 1200
+    items.loc[items['property'] == 'categoryid', 'property'] = -100
+    item_cat_prop = items[items['property'] == -100][['itemid', 'value']].copy()
+    item_cat_prop = item_cat_prop.rename(columns={'value': 'category_id'})
+    item_cat_prop['category_id'] = pd.to_numeric(item_cat_prop['category_id'], errors='coerce')
+    item_cat_prop.dropna(subset=['category_id'], inplace=True)
+    item_cat_prop['category_id'] = item_cat_prop['category_id'].astype(int)
+    item_to_category_map = item_cat_prop.groupby('itemid')['category_id'].first().to_dict()
+
+    # --- Prepare Core Events ---
+    print("Preparing core events...")
     events = events.rename(columns={
         'visitorid': 'visitor_id',
         'event': 'event_type',
         'timestamp': 'event_time'
     })
-
-    events['category_id'] = events['itemid'].map(item2category)
-
-    items['timestamp'] = pd.to_datetime(items['timestamp'], unit='ms')
     events['event_time'] = pd.to_datetime(events['event_time'], unit='ms')
+    if 'transactionid' in events.columns:
+        events.drop(columns=['transactionid'], inplace=True)
 
-    items = items.sort_values(['timestamp','itemid'])
+    # Define unique event by visitor, item, and time.
+    event_core_cols = ['visitor_id', 'itemid', 'event_time', 'event_type']
+    core_events = events[event_core_cols].drop_duplicates().copy()
+    core_events = core_events.sort_values(['visitor_id', 'event_time']) # Essential for session logic
 
+    # --- Prepare Item Properties for Merge ---
+    print("Preparing item properties...")
+    items = items.rename(columns={'timestamp': 'property_time', 'value': 'property_value'})
+    items['property_time'] = pd.to_datetime(items['property_time'], unit='ms')
+    # IMPORTANT: Assume 'property' and 'property_value' are already numerically encoded here
+    items = items.sort_values(['itemid', 'property_time'])
 
-    events = events.sort_values(['event_time', 'itemid'])
-
-    events = pd.merge_asof(
-        events,
-        items,
+    # --- Merge Properties Temporally ---
+    print("Merging properties with events temporally...")
+    events_with_properties = pd.merge_asof(
+        core_events.sort_values('event_time'),
+        items[['itemid', 'property_time', 'property', 'property_value']].sort_values('property_time'), # Select only needed columns
         left_on='event_time',
-        right_on='timestamp',
+        right_on='property_time',
         by='itemid',
         direction='backward'
     )
-    events.dropna(subset=['value'], inplace=True)
-    events.rename(columns={'itemid': 'item_id', 'property': 'item_property', 'value': 'item_property_value'}, inplace=True)
-    events.drop(columns=['transactionid', 'timestamp'], inplace=True)
-    events = events.sort_values(['visitor_id', 'event_time'])
-    events['timestamp'] = pd.to_datetime(events['event_time'], unit='ms')
-    events['time_diff'] = events.groupby('visitor_id')['timestamp'].diff().dt.total_seconds()
-    events['session_id'] = ((events['time_diff'] > session_length*60) | (events['time_diff'].isna())).astype(int).groupby(events['visitor_id']).cumsum()
-    events.groupby(['visitor_id', 'session_id'])
+    # Drop rows where no property could be matched backward in time
+    events_with_properties.dropna(subset=['property_time'], inplace=True)
 
-    events['event_weight'] = 1.0
-    events.loc[events['event_type'] == 'addtocart', 'event_weight'] = 3.0
-    events.loc[events['event_type'] == 'transaction', 'event_weight'] = 5.0
+    # --- Deduplicate based on Core Event, keeping first property match ---
+    print("Selecting first property match per event...")
+    # Sort by event time primarily, maybe property time secondarily if needed
+    events_with_properties = events_with_properties.sort_values(['visitor_id', 'event_time', 'property_time'])
+    # Keep only the first row for each unique event
+    final_events = events_with_properties.drop_duplicates(subset=event_core_cols, keep='first').copy()
+    # Now final_events has one row per core event, with 'property' and 'property_value' columns
+    # representing the first matched property from that time period.
 
-    item_properties = items['property'].unique()
-    print(events)
-    print(events.columns)
-    return
+    # --- Sessionization (on Final Events) ---
+    print("Performing sessionization...")
+    # Calculate diff on the deduplicated data
+    final_events['time_diff'] = final_events.groupby('visitor_id')['event_time'].diff().dt.total_seconds()
+    final_events['session_id'] = ((final_events['time_diff'] > session_length*60) | (final_events['time_diff'].isna())).astype(int).groupby(final_events['visitor_id']).cumsum()
 
-    visitor_sequences = []
+    # --- Add Category and Weights ---
+    print("Adding category and weights...")
+    final_events['category_id'] = final_events['itemid'].map(item_to_category_map)
+    final_events['category_id'] = final_events['category_id'].fillna(0).astype(int)
+
+    final_events['event_weight'] = 1.0
+    final_events.loc[final_events['event_type'] == 'addtocart', 'event_weight'] = 3.0
+    final_events.loc[final_events['event_type'] == 'transaction', 'event_weight'] = 5.0
+
+    # --- Prepare Sequences ---
+    print("Preparing sequences...")
+    # Group the final, deduplicated event data
+    session_grouped_events = final_events.sort_values('event_time').groupby(['visitor_id', 'session_id'])
+
     item_sequences = []
     category_sequences = []
+    # Store original property type sequences first (might contain negatives/gaps)
+    property_type_sequences_orig = []
+    property_value_sequences_str = [] # Store strings first
     item_weights = []
     item_event_types = []
-    
-    for visitor_id, visitor_df in events.groupby('visitor_id'):
-        items = visitor_df['item_id'].tolist()
-        categories = visitor_df['category_id'].tolist()
-        weights = visitor_df['event_weight'].tolist()
-        event_types = visitor_df['event_type'].tolist()
-        
-        visitor_sequences.append(visitor_id)
-        item_sequences.append(items)
-        category_sequences.append(categories)
-        item_weights.append(weights)
-        item_event_types.append(event_types)
-    
-    item_vocab_size = events['item_id'].max() + 1
-    category_vocab_size = events['category_id'].max() + 1
-    
+
+    for (visitor_id, session_id), session_df in session_grouped_events:
+        items_in_session = session_df['itemid'].tolist()
+        if len(items_in_session) > 1:
+            item_sequences.append(items_in_session)
+            category_sequences.append(session_df['category_id'].tolist())
+            # Store original property type, fill NaN with a distinct value like -1 for now
+            property_type_sequences_orig.append(session_df['property'].fillna(-1).astype(int).tolist())
+            # Store property value strings, fill NaNs with a placeholder like 'PAD'
+            property_value_sequences_str.append(session_df['property_value'].fillna('PAD').astype(str).tolist())
+            item_weights.append(session_df['event_weight'].tolist())
+            item_event_types.append(session_df['event_type'].tolist())
+
+    # --- Build Vocabulary for Property Values (remains the same) ---
+    print("Building property value vocabulary...")
+    # ... (prop_value_map creation and conversion to property_value_sequences_int is correct) ...
+    all_prop_values_flat = [val for seq in property_value_sequences_str for val in seq]
+    unique_prop_values = sorted(list(set(all_prop_values_flat)))
+    prop_value_map = {val: i + 1 for i, val in enumerate(unique_prop_values) if val != 'PAD'}
+    prop_value_map['PAD'] = 0
+    property_value_sequences_int = []
+    for seq_str in property_value_sequences_str:
+        property_value_sequences_int.append([prop_value_map.get(val, 0) for val in seq_str])
+
+
+    # --- Build Vocabulary for Property Types (NEW MAPPING) ---
+    print("Building property type vocabulary...")
+    # Flatten to find all unique original property type codes (including negatives)
+    all_prop_types_flat = [ptype for seq in property_type_sequences_orig for ptype in seq]
+    # Get unique original codes, excluding the temporary fillna value (-1) if it wasn't a real code
+    unique_prop_types_orig = sorted([p for p in list(set(all_prop_types_flat)) if p != -1])
+
+    # Create mapping: Original Code -> New Contiguous ID (starting from 1)
+    prop_type_map = {orig_code: i + 1 for i, orig_code in enumerate(unique_prop_types_orig)}
+    # Map the temporary fillna value (-1) to padding index 0
+    prop_type_map[-1] = 0
+
+    # Convert original property type sequences to new mapped ID sequences
+    property_type_sequences_mapped = []
+    for seq_orig in property_type_sequences_orig:
+        property_type_sequences_mapped.append([prop_type_map.get(orig_code, 0) for orig_code in seq_orig]) # Default to 0 if unseen
+
+
+    # --- Calculate Vocab Sizes ---
+    print("Calculating vocab sizes...")
+    all_items = final_events['itemid'].unique().astype(int)
+    all_categories = final_events['category_id'].unique().astype(int)
+    # Use the new map size for property type vocab
+    prop_type_vocab_size = len(prop_type_map)
+    # Property value vocab size calculation remains the same
+    prop_value_vocab_size = len(prop_value_map)
+
+    item_vocab_size = int(np.max(all_items)) + 1 if len(all_items) > 0 else 1
+    category_vocab_size = int(np.max(all_categories)) + 1 if len(all_categories) > 0 else 1
+    # REMOVED old calculation based on np.max(all_prop_types)
+
+
+    print("Data processing finished.")
+    print(f"Property Value Vocab size: {prop_value_vocab_size}")
+    print(f"Property Type Vocab size (Mapped): {prop_type_vocab_size}") # Use new size
+    print(f"Item vocab size: {item_vocab_size}")
+    print(f"Category vocab size: {category_vocab_size}")
     return {
-        'visitor_sequences': visitor_sequences,
         'item_sequences': item_sequences,
         'category_sequences': category_sequences,
+        'property_type_sequences': property_type_sequences_mapped, # Return MAPPED sequences
+        'property_value_sequences': property_value_sequences_int,
         'item_weights': item_weights,
         'item_event_types': item_event_types,
         'item_vocab_size': item_vocab_size,
-        'category_vocab_size': category_vocab_size
+        'category_vocab_size': category_vocab_size,
+        'prop_type_vocab_size': prop_type_vocab_size, # Return correct mapped size
+        'prop_value_vocab_size': prop_value_vocab_size,
+        # 'prop_type_map': prop_type_map # Optional: return map for debugging
     }
 
-def create_data_loaders(data, batch_size=64):
+
+def create_data_loaders(data, batch_size=32, seq_length=5):
     num_sequences = len(data['item_sequences'])
     indices = list(range(num_sequences))
     random.shuffle(indices)
@@ -198,15 +333,21 @@ def create_data_loaders(data, batch_size=64):
     train_dataset = SequenceDataset(
         [data['item_sequences'][i] for i in train_indices],
         [data['category_sequences'][i] for i in train_indices],
+        [data['property_type_sequences'][i] for i in train_indices],
+        [data['property_value_sequences'][i] for i in train_indices],
         [data['item_weights'][i] for i in train_indices],
-        [data['item_event_types'][i] for i in train_indices]
+        [data['item_event_types'][i] for i in train_indices],
+        seq_length=seq_length
     )
     
     val_dataset = SequenceDataset(
         [data['item_sequences'][i] for i in val_indices],
         [data['category_sequences'][i] for i in val_indices],
+        [data['property_type_sequences'][i] for i in val_indices],
+        [data['property_value_sequences'][i] for i in val_indices],
         [data['item_weights'][i] for i in val_indices],
-        [data['item_event_types'][i] for i in val_indices]
+        [data['item_event_types'][i] for i in val_indices],
+        seq_length=seq_length
     )
     
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
@@ -224,12 +365,14 @@ def train_model(model, train_loader, val_loader, epochs=3, learning_rate=0.001, 
         for batch in train_loader:
             item_seqs = batch['item_seq'].to(device)
             cat_seqs = batch['category_seq'].to(device)
+            prop_type_seqs = batch['prop_type_seq'].to(device)
+            prop_value_seqs = batch['prop_value_seq'].to(device)
             item_targets = batch['item_target'].to(device)
             category_targets = batch['category_target'].to(device)
             weights = batch['target_weight'].to(device)
             
             optimizer.zero_grad()
-            cat_logits, item_logits = model(item_seqs, cat_seqs)
+            cat_logits, item_logits = model(item_seqs, cat_seqs, prop_type_seqs, prop_value_seqs)
             
             loss = model.calculate_loss(cat_logits, item_logits, category_targets, item_targets, weights)
             loss.backward()
@@ -244,11 +387,14 @@ def train_model(model, train_loader, val_loader, epochs=3, learning_rate=0.001, 
             for batch in val_loader:
                 item_seqs = batch['item_seq'].to(device)
                 cat_seqs = batch['category_seq'].to(device)
+                prop_type_seqs = batch['prop_type_seq'].to(device)
+                prop_value_seqs = batch['prop_value_seq'].to(device)
                 item_targets = batch['item_target'].to(device)
                 category_targets = batch['category_target'].to(device)
+                weights = batch['target_weight'].to(device)
                 
-                cat_logits, item_logits = model(item_seqs, cat_seqs)
-                loss = model.calculate_loss(cat_logits, item_logits, category_targets, item_targets)
+                cat_logits, item_logits = model(item_seqs, cat_seqs, prop_type_seqs, prop_value_seqs)
+                loss = model.calculate_loss(cat_logits, item_logits, category_targets, item_targets, weights)
                 val_loss += loss.item()
         
         print(f"Epoch {epoch}/{epochs}, Train Loss: {train_loss/len(train_loader):.4f}, Val Loss: {val_loss/len(val_loader):.4f}")
@@ -267,9 +413,11 @@ def evaluate_model(model, dataset, k=10, device='cuda'):
         for batch in eval_loader:
             item_seqs = batch['item_seq'].to(device)
             cat_seqs = batch['category_seq'].to(device)
+            prop_type_seqs = batch['prop_type_seq'].to(device)
+            prop_value_seqs = batch['prop_value_seq'].to(device)
             item_targets = batch['item_target'].to(device)
             
-            _, item_logits = model(item_seqs, cat_seqs)
+            _, item_logits = model(item_seqs, cat_seqs, prop_type_seqs, prop_value_seqs)
             _, top_k_items = torch.topk(item_logits, k, dim=1)
             
             for i in range(len(item_targets)):
@@ -290,22 +438,32 @@ def evaluate_model(model, dataset, k=10, device='cuda'):
 def main(data_path="data/", output_dir="models/"):
     # Load and process data
     data = data_processing(data_path)
-    return
     
     # Create data loaders
-    train_loader, val_loader, train_dataset, val_dataset = create_data_loaders(data, batch_size=64)
+    train_loader, val_loader, train_dataset, val_dataset = create_data_loaders(data, batch_size=64, seq_length=5)
     
+
     # Initialize model
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = SequenceModel(
-        num_items=data['item_vocab_size'],
-        num_categories=data['category_vocab_size'],
-        embedding_dim=64
-    ).to(device)
+    try:
+        model = SequenceModel(
+            num_items=data['item_vocab_size'],
+            num_categories=data['category_vocab_size'],
+            num_prop_types=data['prop_type_vocab_size'],
+            num_prop_values=data['prop_value_vocab_size']
+        ).to(device)
+    except Exception as e:
+        print('Error initializing model:', e)
+        return
+    print('Successfully initialized model')
     
-    # Train model
-    model = train_model(model, train_loader, val_loader, epochs=3, device=device)
-    
+    try:    
+        # Train model
+        model = train_model(model, train_loader, val_loader, epochs=3, device=device)
+    except Exception as e:
+        print('Error training model:', e)
+        return
+    print('Successfully trained model')
     # Save model
     os.makedirs(output_dir, exist_ok=True)
     torch.save(model.state_dict(), os.path.join(output_dir, "recommender_model.pt"))
