@@ -219,14 +219,36 @@ def analyze_category_tree():
     root_categories = category_data[category_data['parentid'].isna()]['categoryid'].nunique()
     
     # Level distribution
+    levels = {}
     
+    # Identify root categories
+    level_0_categories = set(category_data[category_data['parentid'].isna()]['categoryid'])
+    levels[0] = len(level_0_categories)
     
-    # Print results
+    # Identify categories at each level
+    current_level = 0
+    current_parents = level_0_categories
+    
+    while current_parents:
+        current_level += 1
+        # Find children of current parents
+        child_mask = category_data['parentid'].isin(current_parents)
+        children = set(category_data[child_mask]['categoryid'])
+        
+        if not children:
+            break
+            
+        levels[current_level] = len(children)
+        current_parents = children
+    
     print("\nCategory Tree Summary Statistics:")
     print(f"Total categories: {total_categories:,}")
     print(f"Root categories: {root_categories:,}")
     
-    print("\nCategories by level:")     
+    print("\nCategories by level:")
+    for level, count in levels.items():
+        print(f"  Level {level}: {count:,} categories")
+         
     # Calculate average children per parent
     category_data['has_parent'] = ~category_data['parentid'].isna()
     children_per_parent = category_data['has_parent'].sum() / (total_categories - root_categories)

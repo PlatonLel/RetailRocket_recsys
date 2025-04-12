@@ -71,7 +71,8 @@ class HierarchicalMarkovModel(nn.Module):
         
         print(f"Initialized Hierarchical Markov Model using device: {device}")
     
-    def fit(self, events_df, category_df, item_properties_df, batch_size=1024, n_epochs=5):
+    def fit(self, events_df, category_df, item_properties_df, batch_size=1024, n_epochs=5, 
+           max_events=None, max_items=None, max_categories=None):
         """
         Fit the hierarchical model to the data.
         
@@ -81,8 +82,18 @@ class HierarchicalMarkovModel(nn.Module):
             item_properties_df: DataFrame with item properties (itemid, property, value)
             batch_size: Batch size for training
             n_epochs: Number of training epochs
+            max_events: Maximum number of events to use (None = use all)
+            max_items: Maximum number of unique items to include (None = use all)
+            max_categories: Maximum number of categories to include (None = use all)
         """
         print("Building hierarchical Markov model with PyTorch...")
+        
+        # Sample dataset if limits are specified
+        if max_events or max_items or max_categories:
+            events_df, category_df, item_properties_df = self.sample_dataset(
+                events_df, category_df, item_properties_df,
+                max_events=max_events, max_items=max_items, max_categories=max_categories
+            )
         
         # Process category hierarchy
         self._process_category_hierarchy(category_df)
@@ -109,9 +120,16 @@ class HierarchicalMarkovModel(nn.Module):
         """Process the category hierarchy for a two-level structure (parent-child only)."""
         print("Processing two-level category hierarchy...")
         
+        # First identify the actual column names based on what's available
+        cat_col = next((col for col in ['categoryid', 'category_id'] if col in category_df.columns), None)
+        parent_col = next((col for col in ['parentid', 'parent_id'] if col in category_df.columns), None)
+        
+        if not cat_col:
+            raise ValueError(f"Could not find category ID column in category dataframe. Available columns: {category_df.columns.tolist()}")
+        
         # Create category encoder
         self.category_encoder = LabelEncoder()
-        category_ids = category_df['categoryid'].tolist()
+        category_ids = category_df[cat_col].tolist()
         self.category_encoder.fit(category_ids)
         
         # Get encoded categories
@@ -125,8 +143,16 @@ class HierarchicalMarkovModel(nn.Module):
         
         # Process parent-child relationships
         for i, row in category_df.iterrows():
-            cat_id = row['categoryid']
-            parent_id = row['parentid']
+            cat_id = row[cat_col]
+            
+            # Handle case where parent column doesn't exist in sampled data
+            if parent_col is None:
+                # Assume all are root categories if no parent column
+                root_categories.append(cat_id)
+                self.category_levels[cat_id] = 0
+                continue
+            
+            parent_id = row[parent_col]
             
             if pd.isna(parent_id):
                 # This is a root category (level 0)
@@ -141,22 +167,39 @@ class HierarchicalMarkovModel(nn.Module):
                 self.parent_categories[cat_id] = parent_id
                 self.category_children[parent_id].add(cat_id)
         
+        # For categories whose parents aren't in the sampled data, treat them as root
+        if parent_col:
+            for cat_id, parent_id in self.parent_categories.items():
+                if parent_id not in self.category_levels:
+                    # Parent not in dataset, so treat this as a root category
+                    self.category_levels[cat_id] = 0
+                    root_categories.append(cat_id)
+                    # Remove from child list
+                    if cat_id in child_categories:
+                        child_categories.remove(cat_id)
+        
         # Create tensors for category hierarchy
         n_categories = len(self.category_encoder.classes_)
         
         # Create level tensor - maps each category to its level (0 or 1)
         self.level_tensor = torch.zeros(n_categories, dtype=torch.long, device=self.device)
         for cat_id, level in self.category_levels.items():
-            cat_idx = self.category_encoder.transform([cat_id])[0]
-            self.level_tensor[cat_idx] = level
+            try:
+                cat_idx = self.category_encoder.transform([cat_id])[0]
+                self.level_tensor[cat_idx] = level
+            except:
+                pass  # Skip if category can't be transformed
         
         # Create parent tensor - maps each category to its parent
         self.parent_tensor = torch.full((n_categories,), -1, dtype=torch.long, device=self.device)
         for cat_id, parent_id in self.parent_categories.items():
-            if parent_id in self.category_encoder.classes_:
-                cat_idx = self.category_encoder.transform([cat_id])[0]
-                parent_idx = self.category_encoder.transform([parent_id])[0]
-                self.parent_tensor[cat_idx] = parent_idx
+            try:
+                if parent_id in self.category_encoder.classes_:
+                    cat_idx = self.category_encoder.transform([cat_id])[0]
+                    parent_idx = self.category_encoder.transform([parent_id])[0]
+                    self.parent_tensor[cat_idx] = parent_idx
+            except:
+                pass  # Skip if category or parent can't be transformed
         
         print(f"Processed {n_categories} categories")
         print(f"Root categories: {len(root_categories)}")
@@ -428,6 +471,13 @@ class HierarchicalMarkovModel(nn.Module):
         # Normalize item transitions
         self.item_transitions = self._normalize_tensor(self.item_transitions)
     
+    def _normalize_tensor(self, transitions):
+        """Apply smoothing and normalize a transition tensor"""
+        row_sums = transitions.sum(dim=1, keepdim=True)
+        mask = row_sums == 0
+        row_sums[mask] = 1  # Avoid division by zero
+        return (transitions + self.alpha) / (row_sums + self.alpha * transitions.shape[1])
+    
     def _init_embedding_layers(self):
         """Initialize PyTorch embedding layers."""
         n_categories = len(self.category_encoder.classes_)
@@ -619,6 +669,20 @@ class HierarchicalMarkovModel(nn.Module):
                     print("Warning: No valid items in session")
                     return []
                 
+                # Need at least 2 items for meaningful prediction
+                if len(valid_items) < 2:
+                    print(f"Warning: Only {len(valid_items)} valid items in session, need at least 2 for reliable predictions")
+                    # Add a simple fallback prediction for very short sessions
+                    item = valid_items[0]
+                    cat_id = self.item_to_category[item]
+                    # Return random items from same category
+                    same_cat_items = list(self.category_items.get(cat_id, []))
+                    same_cat_items = [i for i in same_cat_items if i != item and i in self.item_encoder.classes_]
+                    if same_cat_items and len(same_cat_items) >= k:
+                        return np.random.choice(same_cat_items, min(k, len(same_cat_items)), replace=False).tolist()
+                    else:
+                        return []
+                
                 # Get encoded items
                 encoded_items = self.item_encoder.transform(valid_items)
                 item_tensor = torch.tensor(encoded_items, dtype=torch.long, device=self.device)
@@ -740,6 +804,467 @@ class HierarchicalMarkovModel(nn.Module):
         
         return recommendations
 
+    def sample_dataset(self, events_df, category_df, item_properties_df, 
+                      max_events=None, max_items=None, max_categories=None, 
+                      date_range=None, sample_users=None):
+        """
+        Sample the dataset to control training time and memory usage.
+        
+        Args:
+            events_df: DataFrame with user events
+            category_df: DataFrame with category hierarchy
+            item_properties_df: DataFrame with item properties
+            max_events: Maximum number of events to use (None = use all)
+            max_items: Maximum number of unique items to include (None = use all)
+            max_categories: Maximum number of categories to include (None = use all)
+            date_range: Tuple of (start_date, end_date) to filter events
+            sample_users: Number of users to sample (None = use all)
+            
+        Returns:
+            Tuple of (sampled_events_df, sampled_category_df, sampled_item_properties_df)
+        """
+        print(f"Sampling dataset with constraints: max_events={max_events}, max_items={max_items}")
+        
+        # Create copies to avoid modifying originals
+        events_df = events_df.copy()
+        category_df = category_df.copy()
+        item_properties_df = item_properties_df.copy()
+        
+        # Check if category_df is empty or invalid
+        if category_df.empty:
+            print("Warning: Category dataframe is empty. Creating a simple one-level hierarchy.")
+            # Create a synthetic category dataframe from item properties
+            category_prop_rows = item_properties_df[
+                (item_properties_df['property'] == 'categoryid') | 
+                (item_properties_df['property'] == 'category_id')
+            ]
+            unique_categories = category_prop_rows['value'].unique()
+            
+            # Create a simple category dataframe with all categories at level 0
+            category_df = pd.DataFrame({
+                'categoryid': unique_categories,
+                'parentid': [None] * len(unique_categories),
+                'level': [0] * len(unique_categories)
+            })
+        
+        # Ensure datetime column is in datetime format
+        datetime_col = next((col for col in ['datetime', 'timestamp'] if col in events_df.columns), None)
+        if datetime_col:
+            events_df[datetime_col] = pd.to_datetime(events_df[datetime_col])
+        
+        # Filter by date range if specified
+        if date_range and datetime_col:
+            start_date, end_date = pd.to_datetime(date_range[0]), pd.to_datetime(date_range[1])
+            events_df = events_df[(events_df[datetime_col] >= start_date) & 
+                                  (events_df[datetime_col] <= end_date)]
+        
+        # Sample users if specified
+        user_col = next((col for col in ['user_id', 'userid', 'visitorid'] if col in events_df.columns), None)
+        if sample_users and user_col:
+            unique_users = events_df[user_col].unique()
+            if len(unique_users) > sample_users:
+                sampled_users = np.random.choice(unique_users, sample_users, replace=False)
+                events_df = events_df[events_df[user_col].isin(sampled_users)]
+        
+        # Sample events if specified
+        if max_events and len(events_df) > max_events:
+            events_df = events_df.sample(max_events, random_state=42)
+        
+        # Get unique items from sampled events
+        item_col = next((col for col in ['item_id', 'itemid'] if col in events_df.columns), None)
+        if not item_col:
+            raise ValueError("Could not identify item column in events dataframe")
+        
+        sampled_items = events_df[item_col].unique()
+        
+        # Limit number of items if specified
+        if max_items and len(sampled_items) > max_items:
+            sampled_items = np.random.choice(sampled_items, max_items, replace=False)
+            events_df = events_df[events_df[item_col].isin(sampled_items)]
+        
+        # Filter item properties to only include sampled items
+        item_prop_col = next((col for col in ['itemid', 'item_id'] if col in item_properties_df.columns), None)
+        if not item_prop_col:
+            raise ValueError("Could not identify item column in properties dataframe")
+        
+        sampled_item_properties_df = item_properties_df[item_properties_df[item_prop_col].isin(sampled_items)]
+        
+        # Get categories for sampled items
+        category_rows = sampled_item_properties_df[
+            (sampled_item_properties_df['property'] == 'categoryid') | 
+            (sampled_item_properties_df['property'] == 'category_id')
+        ]
+        sampled_categories = category_rows['value'].unique()
+        
+        # Identify category and parent columns
+        cat_col = next((col for col in ['categoryid', 'category_id'] if col in category_df.columns), None)
+        parent_col = next((col for col in ['parentid', 'parent_id'] if col in category_df.columns), None)
+        
+        if not cat_col:
+            raise ValueError(f"Could not identify category column in category dataframe. Available columns: {category_df.columns.tolist()}")
+        
+        # Limit number of categories if specified
+        if max_categories and len(sampled_categories) > max_categories:
+            # If we have hierarchy info, try to preserve it by sampling parents first
+            if parent_col:
+                # Create a mapping of categories to their parents
+                cat_to_parent = dict(zip(category_df[cat_col], category_df[parent_col]))
+                
+                # Identify root categories (those with no parent or NaN parent)
+                root_cats = [cat for cat in sampled_categories 
+                            if cat not in cat_to_parent or pd.isna(cat_to_parent.get(cat))]
+                
+                # If we have more root categories than allowed, sample from them
+                if len(root_cats) > max_categories // 2:
+                    sampled_roots = np.random.choice(root_cats, max_categories // 2, replace=False)
+                else:
+                    sampled_roots = root_cats
+                
+                # Start with root categories
+                final_categories = set(sampled_roots)
+                
+                # Add children of sampled roots until we reach max_categories
+                remaining_slots = max_categories - len(final_categories)
+                if remaining_slots > 0:
+                    # Find all children of sampled roots
+                    children = []
+                    for cat in sampled_categories:
+                        if cat_to_parent.get(cat) in final_categories:
+                            children.append(cat)
+                    
+                    # Sample from children if needed
+                    if len(children) > remaining_slots:
+                        sampled_children = np.random.choice(children, remaining_slots, replace=False)
+                        final_categories.update(sampled_children)
+                    else:
+                        final_categories.update(children)
+                
+                # If we still have room, add other categories
+                remaining_slots = max_categories - len(final_categories)
+                if remaining_slots > 0:
+                    other_cats = [cat for cat in sampled_categories if cat not in final_categories]
+                    if other_cats:
+                        if len(other_cats) > remaining_slots:
+                            sampled_others = np.random.choice(other_cats, remaining_slots, replace=False)
+                            final_categories.update(sampled_others)
+                        else:
+                            final_categories.update(other_cats)
+                
+                # Use the final set of categories
+                sampled_categories = list(final_categories)
+            else:
+                # No hierarchy info, just sample randomly
+                sampled_categories = np.random.choice(sampled_categories, max_categories, replace=False)
+            
+            # Filter events again to only include items in sampled categories
+            items_in_categories = category_rows[category_rows['value'].isin(sampled_categories)][item_prop_col].unique()
+            events_df = events_df[events_df[item_col].isin(items_in_categories)]
+            sampled_item_properties_df = sampled_item_properties_df[
+                sampled_item_properties_df[item_prop_col].isin(items_in_categories)
+            ]
+        
+        # Make sure we include all parent categories
+        relevant_categories = set(sampled_categories)
+        
+        if parent_col:
+            # Get all categories and their parents
+            category_hierarchy = dict(zip(category_df[cat_col], category_df[parent_col]))
+            
+            # Add all parents to relevant categories
+            for category in sampled_categories:
+                parent = category_hierarchy.get(category)
+                while parent and not pd.isna(parent):
+                    relevant_categories.add(parent)
+                    parent = category_hierarchy.get(parent)
+        
+        # Filter category dataframe to only include relevant categories and their parents
+        sampled_category_df = category_df[category_df[cat_col].isin(relevant_categories)]
+        
+        # Print statistics
+        print(f"Sampled dataset: {len(events_df)} events, {len(sampled_items)} items, "
+              f"{len(relevant_categories)} categories")
+        
+        return events_df, sampled_category_df, sampled_item_properties_df
+
+    def evaluate(self, validation_sessions, k=10, metrics=['hit_rate', 'ndcg', 'mrr']):
+        """
+        Evaluate the model on validation sessions.
+        
+        Args:
+            validation_sessions: Dictionary of session_id -> session_df
+            k: Number of recommendations to generate
+            metrics: List of metrics to compute
+            
+        Returns:
+            Dictionary of metric name -> score
+        """
+        print(f"Evaluating model on {len(validation_sessions)} validation sessions...")
+        
+        self.eval()
+        results = {
+            'hit_rate': 0,
+            'ndcg': 0, 
+            'mrr': 0,
+            'recall': 0,
+            'precision': 0
+        }
+        
+        valid_sessions = 0
+        
+        for session_id, session_df in tqdm(validation_sessions.items()):
+            # Get all items in the session
+            session_items = session_df['item_id'].tolist()
+            
+            if len(session_items) < 3:  # Skip very short sessions
+                continue
+            
+            # Use all but last item as input, last item as ground truth
+            input_items = session_items[:-1]
+            target_item = session_items[-1]
+            
+            # Get recommendations
+            recs = self.predict_next_items(input_items, k=k)
+            
+            if not recs:  # Skip if no recommendations
+                continue
+            
+            valid_sessions += 1
+            
+            # Calculate metrics
+            if 'hit_rate' in metrics:
+                # Hit rate: 1 if target in recommendations, 0 otherwise
+                results['hit_rate'] += 1 if target_item in recs else 0
+                
+            if 'ndcg' in metrics:
+                # Normalized Discounted Cumulative Gain
+                if target_item in recs:
+                    rank = recs.index(target_item) + 1
+                    results['ndcg'] += 1 / np.log2(rank + 1)
+                    
+            if 'mrr' in metrics:
+                # Mean Reciprocal Rank
+                if target_item in recs:
+                    rank = recs.index(target_item) + 1
+                    results['mrr'] += 1 / rank
+                    
+            if 'recall' in metrics:
+                # For single target item, recall is same as hit rate
+                results['recall'] += 1 if target_item in recs else 0
+                
+            if 'precision' in metrics:
+                # Precision at k
+                results['precision'] += (1 if target_item in recs else 0) / min(k, len(recs))
+        
+        # Normalize results
+        if valid_sessions > 0:
+            for metric in results:
+                results[metric] /= valid_sessions
+        
+        print(f"Evaluation results (k={k}):")
+        for metric, score in results.items():
+            if metric in metrics:
+                print(f"  {metric}: {score:.4f}")
+        
+        return results
+
+    def fit_with_validation(self, events_df, category_df, item_properties_df, batch_size=1024, 
+                            n_epochs=5, validation_ratio=0.2, early_stopping=True, patience=2,
+                            max_events=None, max_items=None, max_categories=None):
+        """
+        Fit the model with validation.
+        
+        Args:
+            events_df: DataFrame with user events
+            category_df: DataFrame with category hierarchy
+            item_properties_df: DataFrame with item properties
+            batch_size: Batch size for training
+            n_epochs: Maximum number of training epochs
+            validation_ratio: Ratio of sessions to use for validation
+            early_stopping: Whether to use early stopping
+            patience: Number of epochs with no improvement before stopping
+            max_events: Maximum number of events to use
+            max_items: Maximum number of unique items
+            max_categories: Maximum number of categories
+            
+        Returns:
+            self
+        """
+        print("Building hierarchical Markov model with validation...")
+        
+        # Sample dataset if limits are specified
+        if max_events or max_items or max_categories:
+            events_df, category_df, item_properties_df = self.sample_dataset(
+                events_df, category_df, item_properties_df,
+                max_events=max_events, max_items=max_items, max_categories=max_categories
+            )
+        
+        # Process category hierarchy
+        self._process_category_hierarchy(category_df)
+        
+        # Process item properties
+        self._process_item_properties(item_properties_df)
+        
+        # Process events and create sessions
+        all_sessions = self._identify_sessions(events_df)
+        
+        # Split sessions for training and validation
+        session_ids = list(all_sessions.keys())
+        np.random.shuffle(session_ids)
+        
+        val_size = int(len(session_ids) * validation_ratio)
+        train_ids = session_ids[val_size:]
+        val_ids = session_ids[:val_size]
+        
+        train_sessions = {sid: all_sessions[sid] for sid in train_ids}
+        val_sessions = {sid: all_sessions[sid] for sid in val_ids}
+        
+        print(f"Split into {len(train_sessions)} training and {len(val_sessions)} validation sessions")
+        
+        # Build transition tensors from training sessions
+        self._build_transition_tensors(train_sessions)
+        
+        # Initialize embedding layers
+        self._init_embedding_layers()
+        
+        # Training loop with validation
+        self.train()
+        best_score = 0
+        best_epoch = 0
+        no_improvement = 0
+        
+        # Dataset for training
+        train_data = []
+        for session_id, session_df in train_sessions.items():
+            items = session_df['item_id'].tolist()
+            if len(items) >= 3:  # Need at least 3 items for training
+                valid_items = [
+                    item for item in items 
+                    if item in self.item_encoder.classes_ and item in self.item_to_category
+                ]
+                if len(valid_items) >= 3:
+                    encoded_items = self.item_encoder.transform(valid_items).tolist()
+                    train_data.append(encoded_items)
+        
+        # Create data loader
+        dataset = SessionDataset(train_data)
+        data_loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            collate_fn=session_collate_fn
+        )
+        
+        # Optimizer
+        optimizer = torch.optim.Adam(self.parameters(), lr=0.001)
+        
+        for epoch in range(n_epochs):
+            # Train for one epoch
+            total_loss = self._train_epoch(data_loader, optimizer)
+            
+            # Evaluate on validation set
+            val_metrics = self.evaluate(val_sessions, k=10, metrics=['hit_rate', 'ndcg'])
+            val_score = val_metrics['hit_rate']  # Use hit rate as the main metric
+            
+            print(f"Epoch {epoch+1}/{n_epochs}, Training Loss: {total_loss:.4f}, Validation Score: {val_score:.4f}")
+            
+            # Check for improvement
+            if val_score > best_score:
+                best_score = val_score
+                best_epoch = epoch
+                no_improvement = 0
+                # Save the best model (could add actual saving here)
+                best_model_state = {k: v.clone() for k, v in self.state_dict().items()}
+            else:
+                no_improvement += 1
+            
+            # Early stopping
+            if early_stopping and no_improvement >= patience:
+                print(f"Early stopping after {epoch+1} epochs")
+                break
+        
+        # If using early stopping, revert to best model
+        if early_stopping and best_epoch < epoch:
+            print(f"Reverting to best model from epoch {best_epoch+1}")
+            self.load_state_dict(best_model_state)
+        
+        print("Hierarchical Markov model trained successfully")
+        return self
+
+    def _train_epoch(self, data_loader, optimizer):
+        """Train for a single epoch."""
+        self.train()
+        total_loss = 0
+        
+        for batch in tqdm(data_loader, desc="Training"):
+            # Get context and target
+            context_items, target_items = batch
+            
+            # Convert to device
+            context_items = [torch.tensor(session, dtype=torch.long, device=self.device) 
+                           for session in context_items]
+            target_items = torch.tensor(target_items, dtype=torch.long, device=self.device)
+            
+            # Zero gradients
+            optimizer.zero_grad()
+            
+            # Forward pass
+            batch_loss = 0
+            for i, (context, target) in enumerate(zip(context_items, target_items)):
+                # Check for empty context
+                if len(context) == 0:
+                    continue
+                    
+                # Get item embeddings for context
+                item_embeds = self.item_embeddings(context)
+                
+                # Encode context safely
+                context_packed = nn.utils.rnn.pack_sequence([item_embeds])
+                _, (hidden, _) = self.context_encoder(context_packed)
+                # Safe squeezing
+                context_encoding = hidden[0] if hidden.size(0) == 1 else hidden.squeeze(0)
+                
+                # Get target item embedding
+                target_embed = self.item_embeddings(target)
+                
+                # Get target category with error handling
+                target_category = self.item_category_tensor[target]
+                if target_category == -1:
+                    # Skip items with unknown category
+                    continue
+                
+                # Category prediction loss
+                cat_pred_input = torch.cat([context_encoding, target_embed], dim=0).unsqueeze(0)
+                cat_pred = self.category_predictor(cat_pred_input)
+                cat_loss = F.cross_entropy(cat_pred, target_category.unsqueeze(0))
+                
+                # Item prediction loss
+                item_pred_input = torch.cat([
+                    context_encoding, 
+                    target_embed, 
+                    self.category_embeddings(target_category)
+                ], dim=0).unsqueeze(0)
+                
+                item_pred = self.item_predictor(item_pred_input)
+                item_loss = F.binary_cross_entropy(item_pred, torch.ones(1, 1, device=self.device))
+                
+                # Combined loss
+                batch_loss += cat_loss + item_loss
+            
+            # Check if we had any valid examples
+            if batch_loss > 0:
+                # Average loss for the batch
+                batch_loss /= len(target_items)
+                
+                # Backward pass
+                batch_loss.backward()
+                optimizer.step()
+                
+                total_loss += batch_loss.item()
+        
+        # Average loss over all batches
+        avg_loss = total_loss / len(data_loader) if len(data_loader) > 0 else 0
+        return avg_loss
+
 
 class SessionDataset(Dataset):
     """Dataset for training on session data."""
@@ -791,13 +1316,53 @@ if __name__ == "__main__":
     ])
     
     # Create model
-    model = HierarchicalMarkovModel(embedding_dim=64)
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    model = HierarchicalMarkovModel(embedding_dim=64, device=device)
     
-    # Fit model
-    model.fit(events_df, category_df, item_props_df, batch_size=128, n_epochs=3)
+    # Sample the dataset first
+    max_events = 50000  # Increased for better validation
+    max_items = 10000
+    sampled_events, sampled_categories, sampled_props = model.sample_dataset(
+        events_df, category_df, item_props_df,
+        max_events=max_events, max_items=max_items
+    )
     
-    # Make predictions
-    test_session = events_df.sort_values('datetime').tail(5)['itemid'].tolist()
-    recommendations = model.predict_next_items(test_session, k=10)
+    # Fit model with validation
+    model.fit_with_validation(
+        sampled_events, sampled_categories, sampled_props, 
+        batch_size=128, n_epochs=5, validation_ratio=0.2,
+        early_stopping=True, patience=2
+    )
     
-    print(f"Recommendations: {recommendations}")
+    # Test on a sample session
+    test_df = sampled_events.copy()
+    if 'datetime' not in test_df.columns and 'timestamp' in test_df.columns:
+        test_df['datetime'] = pd.to_datetime(test_df['timestamp'])
+    if 'item_id' not in test_df.columns and 'itemid' in test_df.columns:
+        test_df['item_id'] = test_df['itemid']
+    
+    # Find the longest session for testing
+    sessions = model._identify_sessions(test_df)
+    longest_session = None
+    max_length = 0
+    
+    for sid, session in sessions.items():
+        if len(session) > max_length:
+            max_length = len(session)
+            longest_session = session
+    
+    if longest_session is not None:
+        test_items = longest_session['item_id'].tolist()
+        # Use all but last 5 items to predict the next 5
+        input_items = test_items[:-5]
+        target_items = test_items[-5:]
+        
+        print(f"Testing with {len(input_items)} input items to predict the next 5 items")
+        print(f"Ground truth: {target_items}")
+        
+        recommendations = model.predict_next_items(input_items, k=10)
+        print(f"Recommendations: {recommendations}")
+        
+        # Calculate matches
+        matches = set(recommendations).intersection(set(target_items))
+        print(f"Matched {len(matches)} out of 5 items: {matches}")
