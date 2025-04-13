@@ -12,12 +12,12 @@ import bisect
 pd.set_option('future.no_silent_downcasting', True)
 
 class SequenceDataset(Dataset):
-    def __init__(self, item_sequences,
-                 category_sequences,
-                 property_type_sequences,
-                 property_value_sequences,
+    def __init__(self, item_sequences=None,
+                 category_sequences=None,
+                 property_type_sequences=None,
+                 property_value_sequences=None,
+                 event_types_sequences=None,
                  item_weights=None,
-                 item_event_types=None,
                  seq_length=5):
         self.samples = []
         
@@ -27,19 +27,21 @@ class SequenceDataset(Dataset):
             seq_prop_types = property_type_sequences[idx]
             seq_prop_values = property_value_sequences[idx]
             seq_weights = item_weights[idx] if item_weights else [1.0] * len(seq_items)
-            seq_event_types = item_event_types[idx] if item_event_types else ["view"] * len(seq_items)
+            seq_event_types = event_types_sequences[idx] if event_types_sequences else ["view"] * len(seq_items)
             
             for j in range(len(seq_items) - 1):
                 item_input = seq_items[:j+1][-seq_length:]
                 category_input = seq_cats[:j+1][-seq_length:]
                 prop_type_input = seq_prop_types[:j+1][-seq_length:]
                 prop_value_input = seq_prop_values[:j+1][-seq_length:]
+                event_type_input = seq_event_types[:j+1][-seq_length:]
                 padding_size = seq_length - len(item_input)
                 if padding_size > 0:
                     item_input = [0] * padding_size + item_input
                     category_input = [0] * padding_size + category_input
                     prop_type_input = [0] * padding_size + prop_type_input
                     prop_value_input = [0] * padding_size + prop_value_input
+                    event_type_input = [0] * padding_size + event_type_input
                 item_target = seq_items[j+1]
                 category_target = seq_cats[j+1]
                 target_event_type = seq_event_types[j+1]
@@ -48,6 +50,7 @@ class SequenceDataset(Dataset):
                     'item_seq': item_input,
                     'category_seq': category_input,
                     'prop_type_seq': prop_type_input,
+                    'event_type_seq': event_type_input,
                     'prop_value_seq': prop_value_input, 
                     'item_target': item_target,
                     'category_target': category_target,
@@ -65,8 +68,10 @@ class SequenceDataset(Dataset):
         return {
             'item_seq': torch.tensor(sample['item_seq'], dtype=torch.long),
             'category_seq': torch.tensor(sample['category_seq'], dtype=torch.long),
+            'event_type_seq': torch.tensor(sample['event_type_seq'], dtype=torch.long),
             'item_target': torch.tensor(sample['item_target'], dtype=torch.long),
             'category_target': torch.tensor(sample['category_target'], dtype=torch.long),
+            'event_type_target': torch.tensor(sample['target_event_type'], dtype=torch.long),
             'prop_type_seq': torch.tensor(sample['prop_type_seq'], dtype=torch.long),
             'prop_value_seq': torch.tensor(sample['prop_value_seq'], dtype=torch.long),
             'target_weight': torch.tensor(sample['target_weight'], dtype=torch.float),
@@ -79,17 +84,20 @@ class SequenceModel(nn.Module):
                  num_categories,
                  num_prop_types,
                  num_prop_values,
-                 embedding_dim=64, # Single dimension for all embeddings for simplicity
+                 num_event_types,
+                 embedding_dim=64,
+                 prop_embedding_dim=32,
                  hidden_dim=128): # Hidden dimension for the GRU
         super(SequenceModel, self).__init__()
 
         self.item_embeddings = nn.Embedding(num_items, embedding_dim, padding_idx=0)
         self.category_embeddings = nn.Embedding(num_categories, embedding_dim, padding_idx=0)
-        self.prop_type_embeddings = nn.Embedding(num_prop_types, embedding_dim, padding_idx=0)
-        self.prop_value_embeddings = nn.Embedding(num_prop_values, embedding_dim, padding_idx=0)
 
+        self.prop_type_embeddings = nn.Embedding(num_prop_types, prop_embedding_dim, padding_idx=0)
+        self.prop_value_embeddings = nn.Embedding(num_prop_values, prop_embedding_dim, padding_idx=0)
+        self.event_type_embeddings = nn.Embedding(num_event_types, prop_embedding_dim, padding_idx=0)
         # Calculate combined embedding size
-        combined_embedding_dim = embedding_dim * 4
+        combined_embedding_dim = (embedding_dim * 2) + (prop_embedding_dim * 3)
 
         # Single GRU to process the combined sequence
         self.gru = nn.GRU(combined_embedding_dim, hidden_dim, batch_first=True)
@@ -99,57 +107,61 @@ class SequenceModel(nn.Module):
         # The item predictor uses the GRU hidden state. You could potentially
         # concatenate the target category embedding if needed, but let's start simple.
         self.item_predictor = nn.Linear(hidden_dim, num_items) # Predict based on sequence summary
+        self.event_type_predictor = nn.Linear(hidden_dim, num_event_types)
+    def forward(self,
+            item_sequences, 
+            category_sequences, 
+            prop_type_sequences, 
+            prop_value_sequences,
+            event_type_sequences):
 
-    def forward(self, item_sequences, category_sequences, prop_type_sequences, prop_value_sequences):
-        batch_size = item_sequences.size(0)
-        seq_length = item_sequences.size(1) # Get sequence length
+        ''' batch_size = item_sequences.size(0) '''
+        ''' seq_length = item_sequences.size(1) # Get sequence length '''
 
         # Get embeddings for all features
         item_emb = self.item_embeddings(item_sequences)          # Shape: [batch_size, seq_length, embedding_dim]
-        category_emb = self.category_embeddings(category_sequences)  # Shape: [batch_size, seq_length, embedding_dim]
+        category_emb = self.category_embeddings(category_sequences)
         prop_type_emb = self.prop_type_embeddings(prop_type_sequences) # Shape: [batch_size, seq_length, embedding_dim]
         prop_value_emb = self.prop_value_embeddings(prop_value_sequences) # Shape: [batch_size, seq_length, embedding_dim]
-
+        event_type_emb = self.event_type_embeddings(event_type_sequences) # Shape: [batch_size, seq_length, embedding_dim]
         # Concatenate embeddings along the feature dimension
-        combined_emb = torch.cat([item_emb, category_emb, prop_type_emb, prop_value_emb], dim=2)
-        # Shape: [batch_size, seq_length, embedding_dim * 4]
+        combined_emb = torch.cat([item_emb, category_emb, prop_type_emb, prop_value_emb, event_type_emb], dim=2)
 
-        # Pass the combined sequence through the GRU
-        # Output shape: [batch_size, seq_length, hidden_dim]
-        # Final hidden state shape: [1, batch_size, hidden_dim]
         gru_output, final_hidden_state = self.gru(combined_emb)
-
-        # Use the final hidden state (from the last sequence step) for prediction
-        # Squeeze the first dimension (layer dim) -> [batch_size, hidden_dim]
         final_hidden_state = final_hidden_state.squeeze(0)
 
         # Predict categories and items based on the final hidden state
         category_logits = self.category_predictor(final_hidden_state)
         item_logits = self.item_predictor(final_hidden_state)
+        event_type_logits = self.event_type_predictor(final_hidden_state)
 
-        return category_logits, item_logits
+        return category_logits, item_logits, event_type_logits
 
-    def calculate_loss(self, category_logits, item_logits, target_category, target_item, weights=None):
+    def calculate_loss(self, 
+                    category_logits, 
+                    item_logits, 
+                    target_category, 
+                    target_item, 
+                    target_event_type, 
+                    event_type_logits, 
+                    weights=None):
         category_loss = F.cross_entropy(category_logits, target_category, reduction='none')
         item_loss = F.cross_entropy(item_logits, target_item, reduction='none')
+        event_type_loss = F.cross_entropy(event_type_logits, target_event_type, reduction='none')
 
         if weights is not None:
-            # Ensure weights have the correct shape if they are per-sample
-             # If weights tensor is 1D [batch_size], expand it for broadcasting
             if weights.dim() == 1:
-                 weights = weights.unsqueeze(1) # Shape becomes [batch_size, 1]
-
-            # Apply weights element-wise
-            # Ensure losses are correctly shaped before multiplication if needed
-            # F.cross_entropy with reduction='none' returns loss per element [batch_size]
+                weights = weights.unsqueeze(1)
+                
             category_loss = category_loss * weights.squeeze() # Squeeze back if necessary
             item_loss = item_loss * weights.squeeze()
+            event_type_loss = event_type_loss * weights.squeeze()
 
         category_loss = category_loss.mean()
         item_loss = item_loss.mean()
-
+        event_type_loss = event_type_loss.mean()
         # Adjust weighting between item and category loss if desired
-        return item_loss * 0.8 + category_loss * 0.2
+        return item_loss * 0.6 + category_loss * 0.2 + event_type_loss * 0.2
 
 def data_processing(data_path, session_length=30):
     print("Loading data...")
@@ -231,6 +243,12 @@ def data_processing(data_path, session_length=30):
     final_events['event_weight'] = 1.0
     final_events.loc[final_events['event_type'] == 'addtocart', 'event_weight'] = 3.0
     final_events.loc[final_events['event_type'] == 'transaction', 'event_weight'] = 5.0
+    event_type_vocab_size = 4
+
+    event_type_map = {'view': 1, 'addtocart': 2, 'transaction': 3}
+    final_events['event_type_encoded'] = final_events['event_type'].map(event_type_map).fillna(0).astype(int)
+
+
 
     # --- Prepare Sequences ---
     print("Preparing sequences...")
@@ -239,11 +257,11 @@ def data_processing(data_path, session_length=30):
 
     item_sequences = []
     category_sequences = []
-    # Store original property type sequences first (might contain negatives/gaps)
+
     property_type_sequences_orig = []
     property_value_sequences_str = [] # Store strings first
     item_weights = []
-    item_event_types = []
+    event_types_sequences = []
 
     for (visitor_id, session_id), session_df in session_grouped_events:
         items_in_session = session_df['itemid'].tolist()
@@ -255,7 +273,7 @@ def data_processing(data_path, session_length=30):
             # Store property value strings, fill NaNs with a placeholder like 'PAD'
             property_value_sequences_str.append(session_df['property_value'].fillna('PAD').astype(str).tolist())
             item_weights.append(session_df['event_weight'].tolist())
-            item_event_types.append(session_df['event_type'].tolist())
+            event_types_sequences.append(session_df['event_type_encoded'].tolist())
 
     # --- Build Vocabulary for Property Values (remains the same) ---
     print("Building property value vocabulary...")
@@ -312,7 +330,8 @@ def data_processing(data_path, session_length=30):
         'property_type_sequences': property_type_sequences_mapped, # Return MAPPED sequences
         'property_value_sequences': property_value_sequences_int,
         'item_weights': item_weights,
-        'item_event_types': item_event_types,
+        'event_types_sequences': event_types_sequences,
+        'event_type_vocab_size': event_type_vocab_size,
         'item_vocab_size': item_vocab_size,
         'category_vocab_size': category_vocab_size,
         'prop_type_vocab_size': prop_type_vocab_size, # Return correct mapped size
@@ -331,22 +350,22 @@ def create_data_loaders(data, batch_size=32, seq_length=5):
     val_indices = indices[train_cutoff:]
     
     train_dataset = SequenceDataset(
-        [data['item_sequences'][i] for i in train_indices],
-        [data['category_sequences'][i] for i in train_indices],
-        [data['property_type_sequences'][i] for i in train_indices],
-        [data['property_value_sequences'][i] for i in train_indices],
-        [data['item_weights'][i] for i in train_indices],
-        [data['item_event_types'][i] for i in train_indices],
+        item_sequences=[data['item_sequences'][i] for i in train_indices],
+        category_sequences=[data['category_sequences'][i] for i in train_indices],
+        property_type_sequences=[data['property_type_sequences'][i] for i in train_indices],
+        property_value_sequences=[data['property_value_sequences'][i] for i in train_indices],
+        item_weights=[data['item_weights'][i] for i in train_indices],
+        event_types_sequences=[data['event_types_sequences'][i] for i in train_indices],
         seq_length=seq_length
     )
     
     val_dataset = SequenceDataset(
-        [data['item_sequences'][i] for i in val_indices],
-        [data['category_sequences'][i] for i in val_indices],
-        [data['property_type_sequences'][i] for i in val_indices],
-        [data['property_value_sequences'][i] for i in val_indices],
-        [data['item_weights'][i] for i in val_indices],
-        [data['item_event_types'][i] for i in val_indices],
+        item_sequences=[data['item_sequences'][i] for i in val_indices],
+        category_sequences=[data['category_sequences'][i] for i in val_indices],
+        property_type_sequences=[data['property_type_sequences'][i] for i in val_indices],
+        property_value_sequences=[data['property_value_sequences'][i] for i in val_indices],
+        item_weights=[data['item_weights'][i] for i in val_indices],
+        event_types_sequences=[data['event_types_sequences'][i] for i in val_indices],
         seq_length=seq_length
     )
     
@@ -356,8 +375,8 @@ def create_data_loaders(data, batch_size=32, seq_length=5):
     return train_loader, val_loader, train_dataset, val_dataset
 
 def train_model(model, train_loader, val_loader, epochs=3, learning_rate=0.001, device='cuda'):
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-    
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=0)
     for epoch in range(1, epochs + 1):
         model.train()
         train_loss = 0.0
@@ -367,14 +386,16 @@ def train_model(model, train_loader, val_loader, epochs=3, learning_rate=0.001, 
             cat_seqs = batch['category_seq'].to(device)
             prop_type_seqs = batch['prop_type_seq'].to(device)
             prop_value_seqs = batch['prop_value_seq'].to(device)
+            event_type_seqs = batch['event_type_seq'].to(device)
             item_targets = batch['item_target'].to(device)
             category_targets = batch['category_target'].to(device)
             weights = batch['target_weight'].to(device)
-            
+            event_type_targets = batch['event_type_target'].to(device)
+
             optimizer.zero_grad()
-            cat_logits, item_logits = model(item_seqs, cat_seqs, prop_type_seqs, prop_value_seqs)
+            cat_logits, item_logits, event_type_logits = model(item_seqs, cat_seqs, prop_type_seqs, prop_value_seqs, event_type_seqs)
             
-            loss = model.calculate_loss(cat_logits, item_logits, category_targets, item_targets, weights)
+            loss = model.calculate_loss(cat_logits, item_logits, category_targets, item_targets, event_type_targets, event_type_logits, weights)
             loss.backward()
             optimizer.step()
             
@@ -389,14 +410,16 @@ def train_model(model, train_loader, val_loader, epochs=3, learning_rate=0.001, 
                 cat_seqs = batch['category_seq'].to(device)
                 prop_type_seqs = batch['prop_type_seq'].to(device)
                 prop_value_seqs = batch['prop_value_seq'].to(device)
+                event_type_seqs = batch['event_type_seq'].to(device)
                 item_targets = batch['item_target'].to(device)
                 category_targets = batch['category_target'].to(device)
                 weights = batch['target_weight'].to(device)
-                
-                cat_logits, item_logits = model(item_seqs, cat_seqs, prop_type_seqs, prop_value_seqs)
-                loss = model.calculate_loss(cat_logits, item_logits, category_targets, item_targets, weights)
+                event_type_targets = batch['event_type_target'].to(device)
+                cat_logits, item_logits, event_type_logits = model(item_seqs, cat_seqs, prop_type_seqs, prop_value_seqs, event_type_seqs)
+                loss = model.calculate_loss(cat_logits, item_logits, category_targets, item_targets, event_type_targets, event_type_logits, weights)
                 val_loss += loss.item()
-        
+                
+        scheduler.step()
         print(f"Epoch {epoch}/{epochs}, Train Loss: {train_loss/len(train_loader):.4f}, Val Loss: {val_loss/len(val_loader):.4f}")
     
     return model
@@ -415,9 +438,10 @@ def evaluate_model(model, dataset, k=10, device='cuda'):
             cat_seqs = batch['category_seq'].to(device)
             prop_type_seqs = batch['prop_type_seq'].to(device)
             prop_value_seqs = batch['prop_value_seq'].to(device)
+            event_type_seqs = batch['event_type_seq'].to(device)
             item_targets = batch['item_target'].to(device)
-            
-            _, item_logits = model(item_seqs, cat_seqs, prop_type_seqs, prop_value_seqs)
+
+            _, item_logits, _ = model(item_seqs, cat_seqs, prop_type_seqs, prop_value_seqs, event_type_seqs)
             _, top_k_items = torch.topk(item_logits, k, dim=1)
             
             for i in range(len(item_targets)):
@@ -435,12 +459,24 @@ def evaluate_model(model, dataset, k=10, device='cuda'):
     
     return {'hit@k': hit_rate, 'mrr': mrr}
 
-def main(data_path="data/", output_dir="models/"):
+def main(
+    data_path="data/", 
+    output_dir="models/", 
+    embedding_dim=64, 
+    prop_embedding_dim=32, 
+    hidden_dim=128, 
+    epochs=3, 
+    batch_size=64, 
+    seq_length=5, 
+    learning_rate=0.001,
+    session_length=30):
     # Load and process data
-    data = data_processing(data_path)
+    data = data_processing(data_path, session_length=session_length)
     
     # Create data loaders
-    train_loader, val_loader, train_dataset, val_dataset = create_data_loaders(data, batch_size=64, seq_length=5)
+    train_loader, val_loader, train_dataset, val_dataset = create_data_loaders(data,        
+                                                                                batch_size=batch_size, 
+                                                                                seq_length=seq_length)
     
 
     # Initialize model
@@ -450,18 +486,26 @@ def main(data_path="data/", output_dir="models/"):
             num_items=data['item_vocab_size'],
             num_categories=data['category_vocab_size'],
             num_prop_types=data['prop_type_vocab_size'],
-            num_prop_values=data['prop_value_vocab_size']
+            num_prop_values=data['prop_value_vocab_size'],
+            num_event_types=data['event_type_vocab_size'],
+            embedding_dim=embedding_dim,
+            prop_embedding_dim=prop_embedding_dim,
+            hidden_dim=hidden_dim
         ).to(device)
     except Exception as e:
         print('Error initializing model:', e)
+        import traceback
+        traceback.print_exc()
         return
     print('Successfully initialized model')
     
     try:    
         # Train model
-        model = train_model(model, train_loader, val_loader, epochs=3, device=device)
+        model = train_model(model, train_loader, val_loader, epochs=epochs, device=device, learning_rate=learning_rate)
     except Exception as e:
         print('Error training model:', e)
+        import traceback
+        traceback.print_exc()
         return
     print('Successfully trained model')
     # Save model
