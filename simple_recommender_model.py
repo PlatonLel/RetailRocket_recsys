@@ -8,7 +8,7 @@ from torch.utils.data import Dataset, DataLoader
 import torch.nn.functional as F
 import random
 from collections import defaultdict
-import bisect
+import math
 pd.set_option('future.no_silent_downcasting', True)
 
 class SequenceDataset(Dataset):
@@ -426,38 +426,107 @@ def train_model(model, train_loader, val_loader, epochs=3, learning_rate=0.001, 
 
 def evaluate_model(model, dataset, k=10, device='cuda'):
     model.eval()
-    
-    eval_loader = DataLoader(dataset, batch_size=64, shuffle=False)
-    hit_sum = 0
-    mrr_sum = 0
-    total_samples = 0
-    
+
+    eval_loader = DataLoader(dataset, batch_size=64, shuffle=False) # Assuming dataset is SequenceDataset
+
+    # Use defaultdict to store metrics per event type (using INTEGER keys now)
+    metrics = defaultdict(lambda: {'hits': 0, 'count': 0, 'mrr_sum': 0.0, 'ndcg_sum': 0.0})
+    # Define integer codes for event types we care about (excluding 0 padding)
+    event_codes_to_track = [1, 2, 3] # Corresponding to view, addtocart, transaction
+
     with torch.no_grad():
         for batch in eval_loader:
             item_seqs = batch['item_seq'].to(device)
             cat_seqs = batch['category_seq'].to(device)
+            event_type_seqs = batch['event_type_seq'].to(device)
             prop_type_seqs = batch['prop_type_seq'].to(device)
             prop_value_seqs = batch['prop_value_seq'].to(device)
-            event_type_seqs = batch['event_type_seq'].to(device)
             item_targets = batch['item_target'].to(device)
+            # Get the INTEGER event type targets
+            target_event_type_codes = batch['event_type_target'].to(device) # This is the integer tensor
 
-            _, item_logits, _ = model(item_seqs, cat_seqs, prop_type_seqs, prop_value_seqs, event_type_seqs)
+            _, item_logits, _ = model(item_seqs, cat_seqs, event_type_seqs, prop_type_seqs, prop_value_seqs)
             _, top_k_items = torch.topk(item_logits, k, dim=1)
-            
+
             for i in range(len(item_targets)):
-                target = item_targets[i].item()
-                
-                if target in top_k_items[i]:
-                    hit_sum += 1
-                    rank = torch.where(top_k_items[i] == target)[0][0].item() + 1
-                    mrr_sum += 1.0 / rank
-                
-                total_samples += 1
-    
-    hit_rate = hit_sum / total_samples
-    mrr = mrr_sum / total_samples
-    
-    return {'hit@k': hit_rate, 'mrr': mrr}
+                target_item = item_targets[i].item()
+                # Get the specific INTEGER event type code for this sample's target
+                event_code = target_event_type_codes[i].item() # Get the integer code
+                predictions = top_k_items[i].tolist()
+
+                # Ensure we only track defined event codes
+                if event_code not in event_codes_to_track:
+                    continue
+
+                hit = 0
+                rank = float('inf')
+                dcg = 0.0 # Use float for dcg
+
+                if target_item in predictions:
+                    hit = 1
+                    try:
+                        rank = predictions.index(target_item) + 1
+                        dcg = 1.0 / math.log2(rank + 1) # Use math.log2
+
+                    except ValueError:
+                        pass # rank remains inf, dcg remains 0
+
+                mrr = 1.0 / rank if hit else 0.0
+                ndcg = dcg
+
+                # Update metrics using the INTEGER event code as the key
+                metrics[event_code]['count'] += 1
+                metrics[event_code]['hits'] += hit
+                metrics[event_code]['mrr_sum'] += mrr
+                metrics[event_code]['ndcg_sum'] += ndcg
+
+                # Update overall metrics ('all') - use string key 'all' for consistency
+                metrics['all']['count'] += 1
+                metrics['all']['hits'] += hit
+                metrics['all']['mrr_sum'] += mrr
+                metrics['all']['ndcg_sum'] += ndcg
+
+    # --- Calculate final metrics ---
+    results = {}
+    # Define keys for the results dictionary (use integers for specific types)
+    all_keys = ['all'] + event_codes_to_track # Keys are 'all', 1, 2, 3
+
+    # Map codes back to strings for user-friendly output dictionary
+    code_to_str_map = {1: 'view', 2: 'addtocart', 3: 'transaction', 'all': 'all'}
+
+    for key in all_keys: # Iterate through 'all', 1, 2, 3
+        count = metrics[key]['count']
+        output_key = code_to_str_map[key] # Get string key for output ('view', etc.)
+
+        if count > 0:
+            hits = metrics[key]['hits']
+            mrr_sum = metrics[key]['mrr_sum']
+            ndcg_sum = metrics[key]['ndcg_sum']
+
+            hit_rate_at_k = hits / count
+            mrr_at_k = mrr_sum / count
+            ndcg_at_k = ndcg_sum / count
+            precision_at_k = hit_rate_at_k # Correct calculation for P@k: hits / (samples * k)
+            recall_at_k = hit_rate_at_k
+
+            # Store results using the STRING key
+            results[output_key] = {
+                f'hit@{k}': hit_rate_at_k,
+                f'mrr@{k}': mrr_at_k,
+                f'ndcg@{k}': ndcg_at_k,
+                f'precision@{k}': precision_at_k,
+                f'recall@{k}': recall_at_k,
+                'count': count
+            }
+        else:
+            # Store results using the STRING key
+            results[output_key] = {
+                f'hit@{k}': 0.0, f'mrr@{k}': 0.0, f'ndcg@{k}': 0.0,
+                f'precision@{k}': 0.0, f'recall@{k}': 0.0, 'count': 0
+            }
+
+    return results
+
 
 def main(
     data_path="data/", 
@@ -469,7 +538,8 @@ def main(
     batch_size=64, 
     seq_length=5, 
     learning_rate=0.001,
-    session_length=30):
+    session_length=30, 
+    k_eval=10):
     # Load and process data
     data = data_processing(data_path, session_length=session_length)
     
@@ -513,9 +583,19 @@ def main(
     torch.save(model.state_dict(), os.path.join(output_dir, "recommender_model.pt"))
     
     # Evaluate model
-    results = evaluate_model(model, val_dataset, device=device)
-    print(f"Final evaluation: Hit@10 = {results['hit@k']:.4f}, MRR = {results['mrr']:.4f}")
-    
+    results = evaluate_model(model, val_dataset, k=k_eval, device=device)
+    # Print detailed results
+    for event_type, metrics in results.items():
+        print(f"\nMetrics for Event Type: '{event_type}' (Count: {metrics['count']})")
+        if metrics['count'] > 0:
+            print(f"  Hit@{k_eval}:      {metrics[f'hit@{k_eval}']:.4f}")
+            print(f"  MRR@{k_eval}:      {metrics[f'mrr@{k_eval}']:.4f}")
+            print(f"  NDCG@{k_eval}:     {metrics[f'ndcg@{k_eval}']:.4f}")
+            print(f"  Precision@{k_eval}: {metrics[f'precision@{k_eval}']:.4f}")
+            print(f"  Recall@{k_eval}:   {metrics[f'recall@{k_eval}']:.4f}")
+        else:
+            print("  No samples evaluated.")
+
     return results
 
 if __name__ == "__main__":
