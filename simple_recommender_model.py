@@ -122,13 +122,9 @@ class SequenceModel(nn.Module):
             prop_value_sequences=None,
             event_type_sequences=None):
 
-        # --- Debugging Checks ---
-        assert item_sequences.min() >= 0, f"Negative index found in item_sequences: {item_sequences.min()}"
-        assert item_sequences.max() < self.item_embeddings.num_embeddings, f"Index >= vocab size in item_sequences. Max: {item_sequences.max()}, Vocab: {self.item_embeddings.num_embeddings}"
+
         item_emb = self.item_embeddings(item_sequences)
 
-        assert category_sequences.min() >= 0, f"Negative index found in category_sequences: {category_sequences.min()}"
-        assert category_sequences.max() < self.category_embeddings.num_embeddings, f"Index >= vocab size in category_sequences. Max: {category_sequences.max()}, Vocab: {self.category_embeddings.num_embeddings}"
         category_emb = self.category_embeddings(category_sequences)
 
         assert prop_type_sequences.min() >= 0, f"Negative index found in prop_type_sequences: {prop_type_sequences.min()}"
@@ -142,7 +138,6 @@ class SequenceModel(nn.Module):
         assert event_type_sequences.min() >= 0, f"Negative index found in event_type_sequences: {event_type_sequences.min()}"
         assert event_type_sequences.max() < self.event_type_embeddings.num_embeddings, f"Index >= vocab size in event_type_sequences. Max: {event_type_sequences.max()}, Vocab: {self.event_type_embeddings.num_embeddings}"
         event_type_emb = self.event_type_embeddings(event_type_sequences)
-        # --- End Debugging Checks ---
 
         combined_emb = torch.cat([item_emb, category_emb, prop_type_emb, prop_value_emb, event_type_emb], dim=2)
         combined_emb = self.embedding_dropout(combined_emb)
@@ -391,10 +386,10 @@ def train_model(model,
             item_targets = batch['item_target'].to(device)
             category_targets = batch['category_target'].to(device)
             weights = batch['target_weight'].to(device)
-            event_type_targets = batch['target_event_type'].to(device)
+            event_type_targets = batch['event_type_target'].to(device)
 
             optimizer.zero_grad()
-            cat_logits, item_logits, event_type_logits = model(item_sequences=None, 
+            cat_logits, item_logits, event_type_logits = model(item_sequences=item_seqs, 
                                                             category_sequences=cat_seqs, 
                                                             prop_type_sequences=prop_type_seqs, 
                                                             prop_value_sequences=prop_value_seqs,
@@ -456,7 +451,7 @@ def train_model(model,
                 item_targets = batch['item_target'].to(device)
                 category_targets = batch['category_target'].to(device)
                 weights = batch['target_weight'].to(device)
-                event_type_targets = batch['target_event_type'].to(device)
+                event_type_targets = batch['event_type_target'].to(device)
 
                 weights_val = batch['target_weight'].to(device)
                 cat_logits, item_logits, event_type_logits = model(item_sequences=item_seqs, 
