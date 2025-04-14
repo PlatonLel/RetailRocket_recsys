@@ -28,9 +28,6 @@ def create_data_loaders(data, batch_size=32, seq_length=5):
         category_sequences=[data['category_sequences'][i] for i in train_indices],
         property_type_sequences=[data['property_type_sequences'][i] for i in train_indices],
         property_value_sequences=[data['property_value_sequences'][i] for i in train_indices],
-        item_weights=[data['item_weights'][i] for i in train_indices],
-        event_types_sequences_int=[data['event_types_sequences_int'][i] for i in train_indices],
-        event_types_sequences_str=[data['event_types_sequences_str'][i] for i in train_indices],
         seq_length=seq_length
     )
     
@@ -39,9 +36,6 @@ def create_data_loaders(data, batch_size=32, seq_length=5):
         category_sequences=[data['category_sequences'][i] for i in val_indices],
         property_type_sequences=[data['property_type_sequences'][i] for i in val_indices],
         property_value_sequences=[data['property_value_sequences'][i] for i in val_indices],
-        item_weights=[data['item_weights'][i] for i in val_indices],
-        event_types_sequences_int=[data['event_types_sequences_int'][i] for i in val_indices],
-        event_types_sequences_str=[data['event_types_sequences_str'][i] for i in val_indices],
         seq_length=seq_length
     )
     
@@ -53,10 +47,8 @@ def create_data_loaders(data, batch_size=32, seq_length=5):
 def train_model(model, 
                 train_loader, 
                 val_loader, 
-                num_items,
                 epochs=3, 
                 learning_rate=0.001, 
-                num_negative_samples=4,
                 loss_weights={'item': 0.7, 'category': 0.3},
                 device='cpu'):
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
@@ -65,31 +57,34 @@ def train_model(model,
     for epoch in range(1, epochs + 1):
         model.train()
         total_loss = 0.0
+        scaler = torch.amp.GradScaler()
 
         for batch in train_loader:
             item_seqs = batch['item_seq'].to(device)
             cat_seqs = batch['category_seq'].to(device)
             prop_type_seqs = batch['prop_type_seq'].to(device)
             prop_value_seqs = batch['prop_value_seq'].to(device)
-            event_type_seqs = batch['event_type_seq'].to(device)
             item_targets = batch['item_target'].to(device)
             category_targets = batch['category_target'].to(device)
 
             optimizer.zero_grad()
-            cat_logits, item_logits = model(item_sequences=item_seqs, 
-                                            category_sequences=cat_seqs, 
-                                            prop_type_sequences=prop_type_seqs, 
-                                            prop_value_sequences=prop_value_seqs,
-                                            event_type_sequences=event_type_seqs)
+            with torch.autocast(device_type='cuda' if device == 'cuda' else 'cpu', dtype=torch.bfloat16):
+                cat_logits, item_logits = model(item_sequences=item_seqs, 
+                                                category_sequences=cat_seqs, 
+                                                prop_type_sequences=prop_type_seqs, 
+                                                prop_value_sequences=prop_value_seqs)
 
-            item_loss = F.cross_entropy(item_logits, item_targets)
-            cat_loss = F.cross_entropy(cat_logits, category_targets)
+                item_loss = F.cross_entropy(item_logits, item_targets)
+                cat_loss = F.cross_entropy(cat_logits, category_targets)
+                
+                loss = (loss_weights['item'] * item_loss + 
+                        loss_weights['category'] * cat_loss)
+                
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             
-            loss = (loss_weights['item'] * item_loss + 
-                    loss_weights['category'] * cat_loss)
-  
-            loss.backward()
-            optimizer.step()
             total_loss += loss.item()
             
         avg_loss = total_loss / len(train_loader)
@@ -103,15 +98,13 @@ def train_model(model,
                 cat_seqs = batch['category_seq'].to(device)
                 prop_type_seqs = batch['prop_type_seq'].to(device)
                 prop_value_seqs = batch['prop_value_seq'].to(device)
-                event_type_seqs = batch['event_type_seq'].to(device)
                 item_targets = batch['item_target'].to(device)
                 category_targets = batch['category_target'].to(device)
 
                 cat_logits, item_logits = model(item_sequences=item_seqs, 
                                                 category_sequences=cat_seqs, 
                                                 prop_type_sequences=prop_type_seqs, 
-                                                prop_value_sequences=prop_value_seqs,
-                                                event_type_sequences=event_type_seqs)
+                                                prop_value_sequences=prop_value_seqs)
                 cat_loss_val = F.cross_entropy(cat_logits, category_targets)
                 item_loss_val = F.cross_entropy(item_logits, item_targets)
 
@@ -135,14 +128,12 @@ def evaluate_model(model, dataset, k=10, device='cuda'):
             cat_seqs = batch['category_seq'].to(device)
             prop_type_seqs = batch['prop_type_seq'].to(device)
             prop_value_seqs = batch['prop_value_seq'].to(device)
-            event_type_seqs = batch['event_type_seq'].to(device)
             item_targets = batch['item_target'].to(device)
 
             _, item_logits = model(item_sequences=item_seqs, 
-                                      category_sequences=cat_seqs, 
-                                      prop_type_sequences=prop_type_seqs, 
-                                      prop_value_sequences=prop_value_seqs,
-                                      event_type_sequences=event_type_seqs)
+                                    category_sequences=cat_seqs, 
+                                    prop_type_sequences=prop_type_seqs, 
+                                    prop_value_sequences=prop_value_seqs)
             _, top_k_items = torch.topk(item_logits, k, dim=1)
 
             for i in range(len(item_targets)):
@@ -217,8 +208,7 @@ def main(
     learning_rate=0.001,
     session_length=30, 
     k_eval=10,
-    num_negative_samples=4,
-    loss_weights={'item': 0.6, 'category': 0.2, 'event_type': 0.2}):
+    loss_weights={'item': 0.7, 'category': 0.3}):
     data = data_processing(data_path, session_length=session_length)
     
     train_loader, val_loader, train_dataset, val_dataset = create_data_loaders(data,        
@@ -232,7 +222,6 @@ def main(
             num_categories=data['category_vocab_size'],
             num_prop_types=data['prop_type_vocab_size'],
             num_prop_values=data['prop_value_vocab_size'],
-            num_event_types=data['event_type_vocab_size'],
             embedding_dim=embedding_dim,
             prop_embedding_dim=prop_embedding_dim,
             hidden_dim=hidden_dim,
@@ -249,11 +238,9 @@ def main(
         model = train_model(model, 
                             train_loader, 
                             val_loader, 
-                            num_items=data['item_vocab_size'],
                             epochs=epochs, 
                             device=device, 
                             learning_rate=learning_rate,
-                            num_negative_samples=num_negative_samples,
                             loss_weights=loss_weights)
     except Exception as e:
         print('Error training model:', e)

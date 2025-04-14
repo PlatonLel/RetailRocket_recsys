@@ -64,10 +64,6 @@ def data_processing(data_path, session_length=30):
     final_events['category_id'] = final_events['itemid'].map(item_to_category_map)
     final_events['category_id'] = final_events['category_id'].fillna(0).astype(int)
 
-    final_events['event_weight'] = 1.0
-    final_events.loc[final_events['event_type'] == 'addtocart', 'event_weight'] = 3.0
-    final_events.loc[final_events['event_type'] == 'transaction', 'event_weight'] = 5.0
-
     print("Preparing sequences...")
     session_grouped_events = final_events.sort_values('event_time').groupby(['visitor_id', 'session_id'])
 
@@ -76,8 +72,6 @@ def data_processing(data_path, session_length=30):
 
     property_type_sequences_orig = []
     property_value_sequences_str = []
-    item_weights = []
-    event_types_sequences = []
 
     for (visitor_id, session_id), session_df in session_grouped_events:
         items_in_session = session_df['itemid'].tolist()
@@ -86,8 +80,6 @@ def data_processing(data_path, session_length=30):
             category_sequences.append(session_df['category_id'].tolist())
             property_type_sequences_orig.append(session_df['property'].fillna(-1).astype(int).tolist())
             property_value_sequences_str.append(session_df['property_value'].fillna('PAD').astype(str).tolist())
-            item_weights.append(session_df['event_weight'].tolist())
-            event_types_sequences.append(session_df['event_type'].tolist())
 
     print("Building property value vocabulary...")
     all_prop_values_flat = [val for seq in property_value_sequences_str for val in seq]
@@ -118,11 +110,6 @@ def data_processing(data_path, session_length=30):
 
     item_vocab_size = int(np.max(all_items)) + 1 if len(all_items) > 0 else 1
     category_vocab_size = int(np.max(all_categories)) + 1 if len(all_categories) > 0 else 1
-    event_type_map_enc = {'view': 1, 'addtocart': 2, 'transaction': 3}
-    event_type_vocab_size = 4 
-    event_types_sequences_int = []
-    for seq_str in event_types_sequences:
-        event_types_sequences_int.append([event_type_map_enc.get(etype, 0) for etype in seq_str])
 
 
     print("Data processing finished.")
@@ -130,16 +117,11 @@ def data_processing(data_path, session_length=30):
     print(f"Property Type Vocab size (Mapped): {prop_type_vocab_size}")
     print(f"Item vocab size: {item_vocab_size}")
     print(f"Category vocab size: {category_vocab_size}")
-    print(f"Event type vocab size: {event_type_vocab_size}")
     return {
         'item_sequences': item_sequences,
         'category_sequences': category_sequences,
         'property_type_sequences': property_type_sequences_mapped,
         'property_value_sequences': property_value_sequences_int,
-        'item_weights': item_weights,
-        'event_types_sequences_int': event_types_sequences_int,
-        'event_types_sequences_str': event_types_sequences,
-        'event_type_vocab_size': event_type_vocab_size,
         'item_vocab_size': item_vocab_size,
         'category_vocab_size': category_vocab_size,
         'prop_type_vocab_size': prop_type_vocab_size,
