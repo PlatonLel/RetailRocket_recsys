@@ -3,338 +3,174 @@ import torch.nn as nn
 import torch.optim as optim
 import os
 import pandas as pd
-import torch.nn.functional as F
-import random
-from collections import defaultdict
-import math
-from data_processing import data_processing
-from dataset import SequenceDataset
+from data_processing import data_processing, prepare_bpr_data
+from dataset import BPRDataset
 from torch.utils.data import DataLoader
-from model import SequenceModel
+from model import BPRMatrixFactorization
+import numpy as np
 
 pd.set_option('future.no_silent_downcasting', True)
 
-def create_data_loaders(data, batch_size=32, seq_length=5):
-    num_sequences = len(data['item_sequences'])
-    indices = list(range(num_sequences))
-    random.shuffle(indices)
-    
-    train_cutoff = int(0.8 * num_sequences)
-    train_indices = indices[:train_cutoff]
-    val_indices = indices[train_cutoff:]
-    
-    train_dataset = SequenceDataset(
-        item_sequences=[data['item_sequences'][i] for i in train_indices],
-        category_sequences=[data['category_sequences'][i] for i in train_indices],
-        property_type_sequences=[data['property_type_sequences'][i] for i in train_indices],
-        property_value_sequences=[data['property_value_sequences'][i] for i in train_indices],
-        seq_length=seq_length
+def create_bpr_loaders(data, batch_size=1024):
+    triplets, user_item_dict, all_items = prepare_bpr_data(
+        data['item_sequences'],
+        data['category_sequences'],
+        data['property_type_sequences'],
+        data['property_value_sequences']
     )
-    
-    val_dataset = SequenceDataset(
-        item_sequences=[data['item_sequences'][i] for i in val_indices],
-        category_sequences=[data['category_sequences'][i] for i in val_indices],
-        property_type_sequences=[data['property_type_sequences'][i] for i in val_indices],
-        property_value_sequences=[data['property_value_sequences'][i] for i in val_indices],
-        seq_length=seq_length
-    )
-    
+    train_cutoff = int(0.8 * len(triplets))
+    train_triplets = triplets[:train_cutoff]
+    val_triplets = triplets[train_cutoff:]
+    train_dataset = BPRDataset(train_triplets)
+    val_dataset = BPRDataset(val_triplets)
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-    
-    return train_loader, val_loader, train_dataset, val_dataset
-
-class DynamicWeightLoss(nn.Module):
-    """
-    Implements learnable loss weights for multi-task learning.
-    Based on the paper "Multi-Task Learning Using Uncertainty to Weigh Losses"
-    by Kendall et al.
-    """
-    def __init__(self, num_tasks=2):
-        super(DynamicWeightLoss, self).__init__()
-        # Initialize log variances (we work in log space for numerical stability)
-        self.log_vars = nn.Parameter(torch.zeros(num_tasks))
-        
-    def forward(self, losses):
-        """
-        Args:
-            losses: List of loss tensors from different tasks
-        Returns:
-            Total weighted loss
-        """
-        weights = torch.exp(-self.log_vars)  # Lower variance -> higher weight
-        # Apply weights to each loss individually and sum
-        weighted_losses = torch.stack([(weights[i] * losses[i] + 0.5 * self.log_vars[i]) for i in range(len(losses))])
-        return weighted_losses.sum(), weights
+    return train_loader, val_loader
 
 def train_model(model, 
                 train_loader, 
                 val_loader, 
-                epochs=3, 
+                epochs=30, 
                 learning_rate=0.001, 
-                loss_weights={'item': 0.7, 'category': 0.3},
+                weight_decay=1e-6,
                 device='cpu'):
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=0)
     
-    # Initialize dynamic weight loss module
-    dynamic_weight = DynamicWeightLoss(num_tasks=2).to(device)
-    # Add parameters from dynamic_weight to the optimizer
-    optimizer.add_param_group({'params': dynamic_weight.parameters()})
-    
-    # For tracking performance and adaptive weights
-    best_val_loss = float('inf')
-    item_weights = []
-    category_weights = []
-
     for epoch in range(1, epochs + 1):
         model.train()
         total_loss = 0.0
-        scaler = torch.amp.GradScaler()
-        
-        epoch_item_weight = 0.0
-        epoch_category_weight = 0.0
-        num_batches = 0
-
         for batch in train_loader:
-            item_seqs = batch['item_seq'].to(device)
-            cat_seqs = batch['category_seq'].to(device)
-            prop_type_seqs = batch['prop_type_seq'].to(device)
-            prop_value_seqs = batch['prop_value_seq'].to(device)
-            item_targets = batch['item_target'].to(device)
-            category_targets = batch['category_target'].to(device)
-
+            user_ids = batch['user_id'].to(device)
+            pos_item_ids = batch['pos_item_id'].to(device)
+            neg_item_ids = batch['neg_item_id'].to(device)
+            pos_cat = batch['pos_cat'].to(device)
+            neg_cat = batch['neg_cat'].to(device)
+            pos_prop_type = batch['pos_prop_type'].to(device)
+            neg_prop_type = batch['neg_prop_type'].to(device)
+            pos_prop_value = batch['pos_prop_value'].to(device)
+            neg_prop_value = batch['neg_prop_value'].to(device)
+            diff = model(user_ids, pos_item_ids, neg_item_ids, pos_cat, neg_cat, pos_prop_type, pos_prop_value, neg_prop_type, neg_prop_value)
+            loss = -torch.log(torch.sigmoid(diff) + 1e-10).mean()
             optimizer.zero_grad()
-            with torch.autocast('cuda' if torch.cuda.is_available() else 'cpu', dtype=torch.bfloat16):
-                cat_logits, item_logits = model(item_sequences=item_seqs, 
-                                                category_sequences=cat_seqs, 
-                                                prop_type_sequences=prop_type_seqs, 
-                                                prop_value_sequences=prop_value_seqs)
-
-                item_loss = F.cross_entropy(item_logits, item_targets)
-                cat_loss = F.cross_entropy(cat_logits, category_targets)
-                
-                # Use dynamic weighting instead of fixed weights
-                loss, weights = dynamic_weight([item_loss, cat_loss])
-                
-                # Track the learned weights for monitoring
-                epoch_item_weight += weights[0].item()
-                epoch_category_weight += weights[1].item()
-                num_batches += 1
-                
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            
+            loss.backward()
+            optimizer.step()
             total_loss += loss.item()
-            
         avg_loss = total_loss / len(train_loader)
-        
-        # Track average weights for this epoch
-        avg_item_weight = epoch_item_weight / num_batches
-        avg_category_weight = epoch_category_weight / num_batches
-        item_weights.append(avg_item_weight)
-        category_weights.append(avg_category_weight)
-        
-        # Validation
+        scheduler.step()
+        print(f"Epoch {epoch+1}/{epochs}, Train Loss: {avg_loss:.4f}")
         model.eval()
         val_loss = 0.0
-        val_item_loss = 0.0
-        val_cat_loss = 0.0
-        
         with torch.no_grad():
             for batch in val_loader:
-                item_seqs = batch['item_seq'].to(device)
-                cat_seqs = batch['category_seq'].to(device)
-                prop_type_seqs = batch['prop_type_seq'].to(device)
-                prop_value_seqs = batch['prop_value_seq'].to(device)
-                item_targets = batch['item_target'].to(device)
-                category_targets = batch['category_target'].to(device)
-
-                cat_logits, item_logits = model(item_sequences=item_seqs, 
-                                                category_sequences=cat_seqs, 
-                                                prop_type_sequences=prop_type_seqs, 
-                                                prop_value_sequences=prop_value_seqs)
-                cat_loss_val = F.cross_entropy(cat_logits, category_targets)
-                item_loss_val = F.cross_entropy(item_logits, item_targets)
-
-                # Apply same dynamic weights for validation loss
-                losses_val = [item_loss_val, cat_loss_val]
-                loss_val, _ = dynamic_weight(losses_val)
-                
-                val_loss += loss_val.item()
-                val_item_loss += item_loss_val.item()
-                val_cat_loss += cat_loss_val.item()
-                
+                user_ids = batch['user_id'].to(device)
+                pos_item_ids = batch['pos_item_id'].to(device)
+                pos_cat = batch['pos_cat'].to(device)
+                pos_prop_type = batch['pos_prop_type'].to(device)
+                pos_prop_value = batch['pos_prop_value'].to(device)
+                pos_score = model(user_ids, pos_item_ids, None, pos_cat, None, pos_prop_type, pos_prop_value, None, None)
+                loss = -torch.log(torch.sigmoid(pos_score) + 1e-10).mean()
+                val_loss += loss.item()
         avg_val_loss = val_loss / len(val_loader)
-        avg_val_item_loss = val_item_loss / len(val_loader)
-        avg_val_cat_loss = val_cat_loss / len(val_loader)
-        
         scheduler.step()
-        
         print(f"Epoch {epoch}/{epochs}, Train Loss: {avg_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
-        print(f"Dynamic Weights - Item: {avg_item_weight:.4f}, Category: {avg_category_weight:.4f}")
-        print(f"Val Losses - Item: {avg_val_item_loss:.4f}, Category: {avg_val_cat_loss:.4f}")
-        
-        # Save the best model based on validation loss
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            best_model_state = model.state_dict()
-    
-    # Return the best model based on validation loss
-    model.load_state_dict(best_model_state)
-    print(f"Final learned weights - Item: {item_weights[-1]:.4f}, Category: {category_weights[-1]:.4f}")
     return model
 
-def evaluate_model(model, dataset, k=10, device='cuda'):
+def evaluate_model(model, val_loader, k=10, device='cuda', num_negatives=100):
     model.eval()
-    eval_loader = DataLoader(dataset, batch_size=64, shuffle=False) 
-    metrics = defaultdict(lambda: {'hits': 0, 'count': 0, 'mrr_sum': 0.0, 'ndcg_sum': 0.0})
-
+    metrics = {'hit': 0, 'mrr': 0, 'ndcg': 0, 'count': 0}
+    all_items = torch.arange(model.item_embeddings.num_embeddings, device=device)
+    rng = np.random.default_rng()
     with torch.no_grad():
-        for batch in eval_loader:
-            item_seqs = batch['item_seq'].to(device)
-            cat_seqs = batch['category_seq'].to(device)
-            prop_type_seqs = batch['prop_type_seq'].to(device)
-            prop_value_seqs = batch['prop_value_seq'].to(device)
-            item_targets = batch['item_target'].to(device)
-
-            _, item_logits = model(item_sequences=item_seqs, 
-                                    category_sequences=cat_seqs, 
-                                    prop_type_sequences=prop_type_seqs, 
-                                    prop_value_sequences=prop_value_seqs)
-            _, top_k_items = torch.topk(item_logits, k, dim=1)
-
-            for i in range(len(item_targets)):
-                target_item = item_targets[i].item()
-                predictions = top_k_items[i].tolist()
-
-                hit = 0
-                rank = float('inf')
-                dcg = 0.0 
-
-                if target_item in predictions:
-                    hit = 1
-                    try:
-                        rank = predictions.index(target_item) + 1
-                        dcg = 1.0 / math.log2(rank + 1) 
-
-                    except ValueError:
-                        pass 
-
-                mrr = 1.0 / rank if hit else 0.0
-                ndcg = dcg
-                metrics['all']['count'] += 1
-                metrics['all']['hits'] += hit
-                metrics['all']['mrr_sum'] += mrr
-                metrics['all']['ndcg_sum'] += ndcg
-
-    results = {}
-    all_keys = ['all'] 
-
-    for key in all_keys: 
-        count = metrics[key]['count']
-        output_key = key
-
-        if count > 0:
-            hits = metrics[key]['hits']
-            mrr_sum = metrics[key]['mrr_sum']
-            ndcg_sum = metrics[key]['ndcg_sum']
-
-            hit_rate_at_k = hits / count
-            mrr_at_k = mrr_sum / count
-            ndcg_at_k = ndcg_sum / count
-            precision_at_k = hit_rate_at_k 
-            recall_at_k = hit_rate_at_k
-
-            results[output_key] = {
-                f'hit@{k}': hit_rate_at_k,
-                f'mrr@{k}': mrr_at_k,
-                f'ndcg@{k}': ndcg_at_k,
-                f'precision@{k}': precision_at_k,
-                f'recall@{k}': recall_at_k,
-                'count': count
-            }
-        else:
-            results[output_key] = {
-                f'hit@{k}': 0.0, f'mrr@{k}': 0.0, f'ndcg@{k}': 0.0,
-                f'precision@{k}': 0.0, f'recall@{k}': 0.0, 'count': 0
-            }
-
-    return results
-
+        for batch in val_loader:
+            user_ids = batch['user_id'].to(device)
+            pos_item_ids = batch['pos_item_id'].to(device)
+            pos_cat = batch['pos_cat'].to(device)
+            pos_prop_type = batch['pos_prop_type'].to(device)
+            pos_prop_value = batch['pos_prop_value'].to(device)
+            batch_size = user_ids.size(0)
+            for i in range(batch_size):
+                user = user_ids[i].unsqueeze(0)
+                pos_item = pos_item_ids[i].unsqueeze(0)
+                cat = pos_cat[i].unsqueeze(0)
+                prop_type = pos_prop_type[i].unsqueeze(0)
+                prop_value = pos_prop_value[i].unsqueeze(0)
+                # Sample negatives (excluding the positive item)
+                neg_items = rng.choice(
+                    all_items.cpu().numpy(),
+                    size=num_negatives,
+                    replace=False
+                )
+                neg_items = [item for item in neg_items if item != pos_item.item()]
+                neg_items = torch.tensor(neg_items[:num_negatives], device=device)
+                # Repeat user and features for negatives
+                user_rep = user.repeat(len(neg_items) + 1)
+                cat_rep = cat.repeat(len(neg_items) + 1)
+                prop_type_rep = prop_type.repeat(len(neg_items) + 1)
+                prop_value_rep = prop_value.repeat(len(neg_items) + 1)
+                # Items: positive + negatives
+                items = torch.cat([pos_item, neg_items])
+                # Scores
+                scores = model(
+                    user_rep,
+                    items,
+                    None,
+                    cat_rep,
+                    None,
+                    prop_type_rep,
+                    prop_value_rep,
+                    None,
+                    None
+                )
+                # Rank the positive item
+                _, indices = torch.topk(scores, k)
+                predictions = items[indices].tolist()
+                metrics['count'] += 1
+                if pos_item.item() in predictions:
+                    metrics['hit'] += 1
+                    rank = predictions.index(pos_item.item()) + 1
+                    metrics['mrr'] += 1.0 / rank
+                    metrics['ndcg'] += 1.0 / np.log2(rank + 1)
+    if metrics['count'] > 0:
+        print(f"Hit@{k}: {metrics['hit']/metrics['count']:.4f}")
+        print(f"MRR@{k}: {metrics['mrr']/metrics['count']:.4f}")
+        print(f"NDCG@{k}: {metrics['ndcg']/metrics['count']:.4f}")
+    else:
+        print("No samples evaluated.")
+    return metrics
 
 def main(
     data_path="data/", 
     output_dir="models/", 
     embedding_dim=64, 
     prop_embedding_dim=32, 
-    hidden_dim=128,
     dropout_rate=0.1,
     epochs=5, 
-    batch_size=32, 
-    seq_length=10, 
+    batch_size=1024, 
     learning_rate=0.001,
-    session_length=30, 
-    k_eval=10,
-    loss_weights={'item': 0.7, 'category': 0.3}):
+    session_length=30):
     data = data_processing(data_path, session_length=session_length)
-    
-    train_loader, val_loader, train_dataset, val_dataset = create_data_loaders(data,        
-                                                                                batch_size=batch_size, 
-                                                                                seq_length=seq_length)    
-
+    train_loader, val_loader = create_bpr_loaders(data, batch_size=batch_size)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    try:
-        model = SequenceModel(
-            num_items=data['item_vocab_size'],
-            num_categories=data['category_vocab_size'],
-            num_prop_types=data['prop_type_vocab_size'],
-            num_prop_values=data['prop_value_vocab_size'],
-            embedding_dim=embedding_dim,
-            prop_embedding_dim=prop_embedding_dim,
-            hidden_dim=hidden_dim,
-            dropout_rate=dropout_rate
-        ).to(device)
-    except Exception as e:
-        print('Error initializing model:', e)
-        import traceback
-        traceback.print_exc()
-        return
+    model = BPRMatrixFactorization(
+        num_users=data['user_vocab_size'],
+        num_items=data['item_vocab_size'],
+        num_prop_types=data['prop_type_vocab_size'],
+        num_prop_values=data['prop_value_vocab_size'],
+        num_categories=data['category_vocab_size'],
+        embedding_dim=embedding_dim,
+        prop_embedding_dim=prop_embedding_dim,
+        dropout_rate=dropout_rate
+    ).to(device)
     print('Successfully initialized model')
-    
-    try:    
-        model = train_model(model, 
-                            train_loader, 
-                            val_loader, 
-                            epochs=epochs, 
-                            device=device, 
-                            learning_rate=learning_rate,
-                            loss_weights=loss_weights)
-    except Exception as e:
-        print('Error training model:', e)
-        import traceback
-        traceback.print_exc()
-        return
-    print('Successfully trained model')
-    # Save model
+    # model = train_model(model, train_loader, val_loader, epochs=epochs, device=device, learning_rate=learning_rate)
+    # print('Successfully trained model')
     os.makedirs(output_dir, exist_ok=True)
     torch.save(model.state_dict(), os.path.join(output_dir, "recommender_model.pt"))
-
-    results = evaluate_model(model, val_dataset, k=k_eval, device=device)
-    for event_type, metrics in results.items():
-        print(f"\nMetrics for Event Type: '{event_type}' (Count: {metrics['count']})")
-        if metrics['count'] > 0:
-            print(f"  Hit@{k_eval}:      {metrics[f'hit@{k_eval}']:.4f}")
-            print(f"  MRR@{k_eval}:      {metrics[f'mrr@{k_eval}']:.4f}")
-            print(f"  NDCG@{k_eval}:     {metrics[f'ndcg@{k_eval}']:.4f}")
-            print(f"  Precision@{k_eval}: {metrics[f'precision@{k_eval}']:.4f}")
-            print(f"  Recall@{k_eval}:   {metrics[f'recall@{k_eval}']:.4f}")
-        else:
-            print("  No samples evaluated.")
-
-    return results
+    # Evaluate after training
+    print('Evaluating model on validation set:')
+    evaluate_model(model, val_loader, k=10, device=device, num_negatives=100)
+    return
 
 if __name__ == "__main__":
     main()
