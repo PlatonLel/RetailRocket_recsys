@@ -44,6 +44,29 @@ def create_data_loaders(data, batch_size=32, seq_length=5):
     
     return train_loader, val_loader, train_dataset, val_dataset
 
+class DynamicWeightLoss(nn.Module):
+    """
+    Implements learnable loss weights for multi-task learning.
+    Based on the paper "Multi-Task Learning Using Uncertainty to Weigh Losses"
+    by Kendall et al.
+    """
+    def __init__(self, num_tasks=2):
+        super(DynamicWeightLoss, self).__init__()
+        # Initialize log variances (we work in log space for numerical stability)
+        self.log_vars = nn.Parameter(torch.zeros(num_tasks))
+        
+    def forward(self, losses):
+        """
+        Args:
+            losses: List of loss tensors from different tasks
+        Returns:
+            Total weighted loss
+        """
+        weights = torch.exp(-self.log_vars)  # Lower variance -> higher weight
+        # Apply weights to each loss individually and sum
+        weighted_losses = torch.stack([(weights[i] * losses[i] + 0.5 * self.log_vars[i]) for i in range(len(losses))])
+        return weighted_losses.sum(), weights
+
 def train_model(model, 
                 train_loader, 
                 val_loader, 
@@ -53,11 +76,25 @@ def train_model(model,
                 device='cpu'):
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=0)
+    
+    # Initialize dynamic weight loss module
+    dynamic_weight = DynamicWeightLoss(num_tasks=2).to(device)
+    # Add parameters from dynamic_weight to the optimizer
+    optimizer.add_param_group({'params': dynamic_weight.parameters()})
+    
+    # For tracking performance and adaptive weights
+    best_val_loss = float('inf')
+    item_weights = []
+    category_weights = []
 
     for epoch in range(1, epochs + 1):
         model.train()
         total_loss = 0.0
         scaler = torch.amp.GradScaler()
+        
+        epoch_item_weight = 0.0
+        epoch_category_weight = 0.0
+        num_batches = 0
 
         for batch in train_loader:
             item_seqs = batch['item_seq'].to(device)
@@ -68,7 +105,7 @@ def train_model(model,
             category_targets = batch['category_target'].to(device)
 
             optimizer.zero_grad()
-            with torch.autocast(device_type='cuda' if device == 'cuda' else 'cpu', dtype=torch.bfloat16):
+            with torch.autocast('cuda' if torch.cuda.is_available() else 'cpu', dtype=torch.bfloat16):
                 cat_logits, item_logits = model(item_sequences=item_seqs, 
                                                 category_sequences=cat_seqs, 
                                                 prop_type_sequences=prop_type_seqs, 
@@ -77,8 +114,13 @@ def train_model(model,
                 item_loss = F.cross_entropy(item_logits, item_targets)
                 cat_loss = F.cross_entropy(cat_logits, category_targets)
                 
-                loss = (loss_weights['item'] * item_loss + 
-                        loss_weights['category'] * cat_loss)
+                # Use dynamic weighting instead of fixed weights
+                loss, weights = dynamic_weight([item_loss, cat_loss])
+                
+                # Track the learned weights for monitoring
+                epoch_item_weight += weights[0].item()
+                epoch_category_weight += weights[1].item()
+                num_batches += 1
                 
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.scale(loss).backward()
@@ -89,9 +131,18 @@ def train_model(model,
             
         avg_loss = total_loss / len(train_loader)
         
+        # Track average weights for this epoch
+        avg_item_weight = epoch_item_weight / num_batches
+        avg_category_weight = epoch_category_weight / num_batches
+        item_weights.append(avg_item_weight)
+        category_weights.append(avg_category_weight)
+        
         # Validation
         model.eval()
         val_loss = 0.0
+        val_item_loss = 0.0
+        val_cat_loss = 0.0
+        
         with torch.no_grad():
             for batch in val_loader:
                 item_seqs = batch['item_seq'].to(device)
@@ -108,13 +159,32 @@ def train_model(model,
                 cat_loss_val = F.cross_entropy(cat_logits, category_targets)
                 item_loss_val = F.cross_entropy(item_logits, item_targets)
 
-                loss_val = (loss_weights['item'] * item_loss_val + 
-                            loss_weights['category'] * cat_loss_val)
+                # Apply same dynamic weights for validation loss
+                losses_val = [item_loss_val, cat_loss_val]
+                loss_val, _ = dynamic_weight(losses_val)
+                
                 val_loss += loss_val.item()
+                val_item_loss += item_loss_val.item()
+                val_cat_loss += cat_loss_val.item()
+                
         avg_val_loss = val_loss / len(val_loader)
+        avg_val_item_loss = val_item_loss / len(val_loader)
+        avg_val_cat_loss = val_cat_loss / len(val_loader)
+        
         scheduler.step()
+        
         print(f"Epoch {epoch}/{epochs}, Train Loss: {avg_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
+        print(f"Dynamic Weights - Item: {avg_item_weight:.4f}, Category: {avg_category_weight:.4f}")
+        print(f"Val Losses - Item: {avg_val_item_loss:.4f}, Category: {avg_val_cat_loss:.4f}")
+        
+        # Save the best model based on validation loss
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            best_model_state = model.state_dict()
     
+    # Return the best model based on validation loss
+    model.load_state_dict(best_model_state)
+    print(f"Final learned weights - Item: {item_weights[-1]:.4f}, Category: {category_weights[-1]:.4f}")
     return model
 
 def evaluate_model(model, dataset, k=10, device='cuda'):
