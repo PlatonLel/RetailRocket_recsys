@@ -180,3 +180,5 @@ data/*
 #funnel directory
 funnel_plots/*
 
+#models_directory
+models/*

@@ -1,23 +1,28 @@
-import torch
+import pandas as pd
+import numpy as np
+from collections import defaultdict
+import random
 from torch.utils.data import Dataset
 
 class BPRDataset(Dataset):
-    def __init__(self, triplets):
-        self.triplets = triplets
-
+    def __init__(self, train_data, num_items):
+        self.train_data = train_data
+        self.num_items = num_items
+        self.user_positive_items = defaultdict(set)
+        for u, i, _ in train_data:
+            self.user_positive_items[u].add(i)
+    
     def __len__(self):
-        return len(self.triplets)
-
+        return len(self.train_data)
+    
     def __getitem__(self, idx):
-        user, pos_item, neg_item, pos_cat, neg_cat, pos_prop_type, neg_prop_type, pos_prop_value, neg_prop_value = self.triplets[idx]
-        return {
-            'user_id': torch.tensor(user, dtype=torch.long),
-            'pos_item_id': torch.tensor(pos_item, dtype=torch.long),
-            'neg_item_id': torch.tensor(neg_item, dtype=torch.long),
-            'pos_cat': torch.tensor(pos_cat, dtype=torch.long),
-            'neg_cat': torch.tensor(neg_cat, dtype=torch.long),
-            'pos_prop_type': torch.tensor(pos_prop_type, dtype=torch.long),
-            'neg_prop_type': torch.tensor(neg_prop_type, dtype=torch.long),
-            'pos_prop_value': torch.tensor(pos_prop_value, dtype=torch.long),
-            'neg_prop_value': torch.tensor(neg_prop_value, dtype=torch.long),
-        }
+        user, pos_item, weight = self.train_data[idx]
+        neg_item = random.randint(0, self.num_items - 1)
+        while neg_item in self.user_positive_items[user]:
+            neg_item = random.randint(0, self.num_items - 1)
+        return (
+            np.int64(user),
+            np.int64(pos_item),
+            np.int64(neg_item),
+            np.float32(weight)
+        )
