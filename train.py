@@ -4,11 +4,12 @@ import torch.optim as optim
 import os
 import pandas as pd
 import numpy as np
+import pickle
 from sklearn.metrics import roc_auc_score
-from data_processing import process_retailrocket_data, build_item_feature_matrix
+from data_processing import process_retailrocket_data
 from dataset import BPRDataset
 from torch.utils.data import DataLoader
-from model import BPRMatrixFactorization, cbf_recommend
+from model import BPRMatrixFactorization
 
 pd.set_option('future.no_silent_downcasting', True)
 
@@ -127,16 +128,16 @@ def main(
     data_path="data/", 
     output_dir="models/", 
     embedding_dim=64, 
-    dropout_rate=0.1,
-    epochs=5, 
-    batch_size=1024, 
+    dropout_rate=0.2,
+    epochs=10, 
+    batch_size=256, 
     learning_rate=0.001,
-    weight_decay=1e-4):
+    weight_decay=1e-2):
     data = process_retailrocket_data(data_path, 
                                      min_interactions=7, 
                                      weights={'view': 1.0, 
-                                              'addtocart': 3.0, 
-                                              'transaction': 5.0})
+                                              'addtocart': 2.0, 
+                                              'transaction': 3.0})
     train_dataset = BPRDataset(data['train_data'], data['num_items'])
     val_dataset = BPRDataset(data['test_data'], data['num_items'])
     
@@ -164,7 +165,22 @@ def main(
 
     print('Evaluating model on validation set:')
     evaluate_model(model, val_loader, device=device)
+    with open(os.path.join(output_dir, "item_encoder.pkl"), 'wb') as f:
+        pickle.dump(data['item_encoder'], f)
+    with open(os.path.join(output_dir, "user_encoder.pkl"), 'wb') as f:
+        pickle.dump(data['user_encoder'], f)
+
+    model_params = {
+        'num_users': data['num_users'],
+        'num_items': data['num_items'],
+        'embedding_dim': embedding_dim,
+        'dropout_rate': dropout_rate
+    }
+    with open(os.path.join(output_dir, "model_params.pkl"), 'wb') as f:
+        pickle.dump(model_params, f)    
+    print('Successfully saved model parameters')
+    
     return
 
 if __name__ == "__main__":
-    main(dropout_rate=0.2, epochs=20, weight_decay=1e-2, embedding_dim=64)
+    main()
