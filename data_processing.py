@@ -8,9 +8,6 @@ from sklearn import preprocessing
 INTERACTION_WEIGHTS = {'view': 1.0, 'addtocart': 2.0, 'transaction': 3.0}
 
 def process_retailrocket_data(data_path, event_limit=None, weights=INTERACTION_WEIGHTS, min_interactions=2):
-    """
-    Process RetailRocket dataset for hybrid BPR+CBF with time-varying features.
-    """
     print("Loading events...")
     events = pd.read_csv(os.path.join(data_path, 'events.csv'))
     if event_limit:
