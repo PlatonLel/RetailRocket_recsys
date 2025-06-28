@@ -123,28 +123,5 @@ def process_retailrocket_data(data_path, event_limit=None, weights=INTERACTION_W
         "prop_value_encoder": prop_value_encoder,
     }
 
-def build_item_feature_matrix(latest_item_features_map, num_items, prop_type_vocab_size, prop_value_vocab_size):
-    num_feature_dimensions = prop_type_vocab_size + prop_value_vocab_size
-    rows, cols, vals = [], [], []
-    
-    for item_idx in range(num_items):
-        features = latest_item_features_map.get(item_idx, {})
-        for prop_type_idx, prop_val_idx in features.items():
-            if 0 <= prop_type_idx < prop_type_vocab_size:
-                rows.append(item_idx)
-                cols.append(prop_type_idx)
-                vals.append(1)
-            
-            if 0 <= prop_val_idx < prop_value_vocab_size:
-                col_idx = prop_type_vocab_size + prop_val_idx
-                rows.append(item_idx)
-                cols.append(col_idx)
-                vals.append(1)
-
-    X = sp.coo_matrix((vals, (rows, cols)), shape=(num_items, num_feature_dimensions)).tocsr()
-    X.sum_duplicates()
-    X.data[:] = 1
-    print(f"Built item feature matrix with shape: {X.shape}")
-    return X
 
 
